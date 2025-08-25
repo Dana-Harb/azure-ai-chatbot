@@ -20,14 +20,13 @@ A basic chatbot using Azure OpenAI GPT-4o.
 
 ---
 
-## 🖥 Running Locally
+## Running Locally
 
 ### 1. Console Chatbot
 
 You can test the chatbot in your terminal with:
 
 ```bash
-cd chatbot
 python chatbot.py
 ```
 
