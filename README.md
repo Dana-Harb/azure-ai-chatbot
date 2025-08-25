@@ -1,41 +1,67 @@
 # azure-ai-chatbot
 A basic chatbot using Azure OpenAI GPT-4o.
 
-Key features: Welcome message, Conversation flow with AI, Exit/quit commands
 
+### Explanation of folders:
 
-### ** Setup Instructions (Local)**
+* **`chatbot/`**:
+  Contains the console-based chatbot implementation.
+  You can run this locally to test the conversation loop in the terminal.
 
-1. Clone the repository:
+* **`function_app/`**:
+  Contains the Azure Function code (`function_app.py`).
+  This is what gets deployed to Azure and runs as an HTTP endpoint.
 
-```
-git clone https://github.com/Dana-Harb/azure-ai-chatbot.git
-cd azure-ai-chatbot
-```
+* **`requirements.txt`**:
+  Lists the Python packages required by both the console chatbot and the Azure Function.
 
-2. Create a virtual environment:
+* **`host.json`**:
+  Global configuration file used by Azure Functions runtime.
 
-```
-python -m venv venv
-venv\Scripts\activate   # Windows
-# source venv/bin/activate  # macOS/Linux
-```
+---
 
-3. Set environment variables locally (or create `.env` for testing):
+## 🖥 Running Locally
 
-```
-$env:ENDPOINT_URL="https://your-resource.openai.azure.com/"
-$env:DEPLOYMENT_NAME="gpt-4o"
-$env:AZURE_OPENAI_API_KEY="your_api_key_here"
-```
+### 1. Console Chatbot
 
-4. Run the chatbot locally:
+You can test the chatbot in your terminal with:
 
-```
+```bash
+cd chatbot
 python chatbot.py
 ```
 
----
+Features available locally:
+
+* Welcome message
+* User input processing
+* AI response generation
+* Conversation loop
+* Graceful exit (`exit` command)
+
+### 2. Azure Function (local test)
+
+From the project root, run:
+
+```
+func start
+```
+
+This will start the Azure Functions Core Tools runtime.
+You’ll see an endpoint like:
+
+```
+http://localhost:7071/api/ChatbotFunction
+```
+
+You can send a POST request with JSON:
+
+```json
+{
+  "user_input": "Hello"
+}
+```
+
 
 ### **. API Configuration**
 
