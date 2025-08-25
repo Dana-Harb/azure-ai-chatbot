@@ -26,7 +26,7 @@ while True:
     try:
         user_input = input("You: ").strip().lower() 
         if user_input in exit_list:
-            print("Chatbot: Goodbye! Have a great day! 👋")
+            print("Chatbot: Goodbye! Have a great day!")
             break
 
         messages.append({"role": "user", "content": user_input})
