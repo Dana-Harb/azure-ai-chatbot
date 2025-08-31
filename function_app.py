@@ -3,31 +3,34 @@ import os
 import json
 import logging
 from openai import AzureOpenAI
+from session_store import create_session, get_session, update_session, clear_session
 
-# Initialize Function App
+
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
-# Load environment variables
+
 endpoint = os.environ["ENDPOINT_URL"]
 deployment = os.environ["DEPLOYMENT_NAME"]
 api_key = os.environ["AZURE_OPENAI_API_KEY"]
 
-# Initialize Azure OpenAI client
+
 client = AzureOpenAI(
     azure_endpoint=endpoint,
     api_key=api_key,
     api_version="2025-01-01-preview",
 )
 
-# In-memory conversation history
-conversation_history = []
 exit_keywords = ["exit", "quit", "bye"]
+history_command = "/history"
+clear_command = "/clear"
+restart_command = "/restart"
 
 @app.route(route="chat", methods=["POST"])
 def chat(req: func.HttpRequest) -> func.HttpResponse:
     try:
         req_body = req.get_json()
         user_input = req_body.get("message", "").strip()
+        session_id = req_body.get("session_id")
 
         if not user_input:
             return func.HttpResponse(
@@ -36,23 +39,57 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
 
+        
+        if not session_id:
+            session_id = create_session()
+
         # Exit keywords reset conversation
         if user_input.lower() in exit_keywords:
-            conversation_history.clear()
+            clear_session(session_id)
             return func.HttpResponse(
-                json.dumps({"reply": "Chatbot: Goodbye!"}),
+                json.dumps({"reply": "Chatbot: Goodbye!", "session_id": session_id}),
                 status_code=200,
                 mimetype="application/json"
             )
 
-        # Append user message
-        conversation_history.append({"role": "user", "content": user_input})
+        
+        if user_input.lower() == history_command:
+            session = get_session(session_id)
+            conversation = [
+                f"{msg['role'].capitalize()}: {msg['content']}"
+                for msg in session.get("history", [])
+                if msg["role"] != "system"
+            ]
+            return func.HttpResponse(
+                json.dumps({"reply": "\n".join(conversation), "session_id": session_id}),
+                status_code=200,
+                mimetype="application/json"
+            )
 
-        # Build messages
-        messages = [{"role": "system", "content": "You are a helpful AI assistant."}]
-        messages.extend(conversation_history)
+        elif user_input.lower() == clear_command:
+            clear_session(session_id)
+            return func.HttpResponse(
+                json.dumps({"reply": "Chatbot: Conversation cleared.", "session_id": session_id}),
+                status_code=200,
+                mimetype="application/json"
+            )
 
-        # Call Azure OpenAI
+        elif user_input.lower() == restart_command:
+            session_id = create_session()
+            return func.HttpResponse(
+                json.dumps({"reply": f"Chatbot: Session restarted.", "session_id": session_id}),
+                status_code=200,
+                mimetype="application/json"
+            )
+
+        
+        session = get_session(session_id)
+        history = session.get("history", [])
+
+        
+        messages = history + [{"role": "user", "content": user_input}]
+
+        
         completion = client.chat.completions.create(
             model=deployment,
             messages=messages,
@@ -61,10 +98,12 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
         )
 
         ai_reply = completion.choices[0].message.content.strip()
-        conversation_history.append({"role": "assistant", "content": ai_reply})
+
+        
+        update_session(session_id, user_input, ai_reply, client_openai=client, deployment=deployment)
 
         return func.HttpResponse(
-            json.dumps({"reply": ai_reply}),
+            json.dumps({"reply": ai_reply, "session_id": session_id}),
             status_code=200,
             mimetype="application/json"
         )
