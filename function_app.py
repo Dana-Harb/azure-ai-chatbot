@@ -2,23 +2,10 @@ import azure.functions as func
 import os
 import json
 import logging
-from openai import AzureOpenAI
 from session_store import create_session, get_session, update_session, clear_session
-
+from rag_pipeline import generate_response_with_context 
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
-
-
-endpoint = os.environ["ENDPOINT_URL"]
-deployment = os.environ["DEPLOYMENT_NAME"]
-api_key = os.environ["AZURE_OPENAI_API_KEY"]
-
-
-client = AzureOpenAI(
-    azure_endpoint=endpoint,
-    api_key=api_key,
-    api_version="2025-01-01-preview",
-)
 
 exit_keywords = ["exit", "quit", "bye"]
 history_command = "/history"
@@ -39,11 +26,10 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
 
-        
         if not session_id:
             session_id = create_session()
 
-        # Exit keywords reset conversation
+        # Handle exit/commands
         if user_input.lower() in exit_keywords:
             clear_session(session_id)
             return func.HttpResponse(
@@ -51,9 +37,7 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
                 status_code=200,
                 mimetype="application/json"
             )
-
-        
-        if user_input.lower() == history_command:
+        elif user_input.lower() == history_command:
             session = get_session(session_id)
             conversation = [
                 f"{msg['role'].capitalize()}: {msg['content']}"
@@ -65,7 +49,6 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
                 status_code=200,
                 mimetype="application/json"
             )
-
         elif user_input.lower() == clear_command:
             clear_session(session_id)
             return func.HttpResponse(
@@ -73,7 +56,6 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
                 status_code=200,
                 mimetype="application/json"
             )
-
         elif user_input.lower() == restart_command:
             session_id = create_session()
             return func.HttpResponse(
@@ -82,28 +64,17 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
 
-        
-        session = get_session(session_id)
-        history = session.get("history", [])
+
+        rag_response = generate_response_with_context(user_input)
+        ai_reply = rag_response["answer"]
+        references = rag_response.get("references", [])
+
+       
+        update_session(session_id, user_input, ai_reply)
 
         
-        messages = history + [{"role": "user", "content": user_input}]
-
-        
-        completion = client.chat.completions.create(
-            model=deployment,
-            messages=messages,
-            max_tokens=500,
-            temperature=0.7
-        )
-
-        ai_reply = completion.choices[0].message.content.strip()
-
-        
-        update_session(session_id, user_input, ai_reply, client_openai=client, deployment=deployment)
-
         return func.HttpResponse(
-            json.dumps({"reply": ai_reply, "session_id": session_id}),
+            json.dumps({"reply": ai_reply, "references": references, "session_id": session_id}),
             status_code=200,
             mimetype="application/json"
         )

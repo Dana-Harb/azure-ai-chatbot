@@ -1,8 +1,14 @@
+
 azure-functions
-openai>=1.0.0
 python-dotenv
 pdfplumber
 pandas
 numpy
 azure-cosmos
 tiktoken
+openai
+azure-search-documents
+azure-core
+
+
+
