@@ -1,5 +1,4 @@
 import azure.functions as func
-import os
 import json
 import logging
 from session_store import create_session, get_session, update_session, clear_session

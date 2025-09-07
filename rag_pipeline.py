@@ -1,4 +1,3 @@
-
 import os
 from openai import AzureOpenAI
 from azure.search.documents import SearchClient

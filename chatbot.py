@@ -1,4 +1,3 @@
-import os
 from dotenv import load_dotenv
 from session_store import create_session, get_session, update_session, clear_session
 from rag_pipeline import generate_response_with_context 
