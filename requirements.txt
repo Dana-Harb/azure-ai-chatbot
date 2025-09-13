@@ -8,6 +8,8 @@ tiktoken
 openai
 azure-search-documents
 azure-core
+azure-ai-documentintelligence
+azure-storage-blob
 
 
 

@@ -2,7 +2,7 @@ import azure.functions as func
 import json
 import logging
 from session_store import create_session, get_session, update_session, clear_session
-from rag_pipeline import generate_response_with_context 
+from rag_pipeline import generate_response_with_context, index_all_blobs_stream
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
@@ -10,6 +10,14 @@ exit_keywords = ["exit", "quit", "bye"]
 history_command = "/history"
 clear_command = "/clear"
 restart_command = "/restart"
+
+
+try:
+    logging.info("Indexing all documents from Blob Storage (if not already indexed)...")
+    index_all_blobs_stream()
+    logging.info("Blob indexing completed.")
+except Exception as e:
+    logging.error(f"Blob indexing failed at startup: {str(e)}")
 
 @app.route(route="chat", methods=["POST"])
 def chat(req: func.HttpRequest) -> func.HttpResponse:
@@ -58,22 +66,24 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
         elif user_input.lower() == restart_command:
             session_id = create_session()
             return func.HttpResponse(
-                json.dumps({"reply": f"Chatbot: Session restarted.", "session_id": session_id}),
+                json.dumps({"reply": "Chatbot: Session restarted.", "session_id": session_id}),
                 status_code=200,
                 mimetype="application/json"
             )
-
 
         rag_response = generate_response_with_context(user_input)
         ai_reply = rag_response["answer"]
         references = rag_response.get("references", [])
 
-       
+        # Update session with conversation history
         update_session(session_id, user_input, ai_reply)
 
-        
         return func.HttpResponse(
-            json.dumps({"reply": ai_reply, "references": references, "session_id": session_id}),
+            json.dumps({
+                "reply": ai_reply,
+                "references": references,
+                "session_id": session_id
+            }),
             status_code=200,
             mimetype="application/json"
         )
