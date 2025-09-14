@@ -10,6 +10,7 @@ azure-search-documents
 azure-core
 azure-ai-documentintelligence
 azure-storage-blob
+azure-cognitiveservices-speech
 
 
 

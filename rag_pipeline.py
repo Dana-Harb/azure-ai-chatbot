@@ -11,7 +11,7 @@ from azure.search.documents.indexes.models import (
     SimpleField,
     VectorSearch,
     HnswAlgorithmConfiguration,
-    VectorSearchProfile,  # Import the VectorSearchProfile class
+    VectorSearchProfile, 
 )
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents.models import VectorizedQuery
@@ -22,18 +22,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# -------------------------------
-# ENV VARIABLES
-# -------------------------------
+
 AZURE_OPENAI_ENDPOINT = os.getenv("ENDPOINT_URL")
 AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_DEPLOYMENT = os.getenv("DEPLOYMENT_NAME")
-EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_MODEL = "text-embedding-3-large"
 
 SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT")
 SEARCH_KEY = os.getenv("AZURE_SEARCH_KEY")
 
-# Use env var if set, otherwise default to "document-index"
+
 SEARCH_INDEX = os.getenv("AZURE_INDEX_NAME", "document-index")
 TOP_K = 3
 
@@ -43,9 +41,7 @@ DOC_INTELLIGENCE_KEY = os.getenv("DOC_INTELLIGENCE_KEY")
 BLOB_CONNECTION_STRING = os.getenv("BLOB_CONNECTION_STRING")
 BLOB_CONTAINER = os.getenv("BLOB_CONTAINER_NAME")
 
-# -------------------------------
-# CLIENTS
-# -------------------------------
+
 doc_client = DocumentIntelligenceClient(
     endpoint=DOC_INTELLIGENCE_ENDPOINT,
     credential=AzureKeyCredential(DOC_INTELLIGENCE_KEY)
@@ -71,17 +67,14 @@ index_client = SearchIndexClient(
 blob_service_client = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
 container_client = blob_service_client.get_container_client(BLOB_CONTAINER)
 
-# -------------------------------
-# INDEX CREATION
-# -------------------------------
+
 def create_search_index(index_name: str):
-    """Create the search index if it does not already exist."""
     existing_indexes = [idx.name for idx in index_client.list_indexes()]
     if index_name in existing_indexes:
         print(f"[INFO] Index '{index_name}' already exists. Skipping creation.")
         return
 
-    # Define fields
+    
     fields = [
         SimpleField(name="chunk_id", type=SearchFieldDataType.String, key=True),
         SearchableField(name="title", type=SearchFieldDataType.String, searchable=True),
@@ -90,27 +83,27 @@ def create_search_index(index_name: str):
             name="text_vector",
             type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
             searchable=True,
-            vector_search_dimensions=1536,
-            vector_search_profile_name="my-hnsw-profile"  # ✅ new param name
+            vector_search_dimensions=3072,
+            vector_search_profile_name="my-hnsw-profile"  
         )
     ]
 
-    # Define vector search (new style)
+    
     vector_search = VectorSearch(
         profiles=[
             VectorSearchProfile(
-                name="my-hnsw-profile",  # Profile name
-                algorithm_configuration_name="my-hnsw-algorithm"  # Reference algorithm
+                name="my-hnsw-profile",  
+                algorithm_configuration_name="my-hnsw-algorithm"  
             )
         ],
         algorithms=[
             HnswAlgorithmConfiguration(
-                name="my-hnsw-algorithm",  # Algorithm name
+                name="my-hnsw-algorithm",  
             )
         ]
     )
 
-    # Create the index object
+   
     index = SearchIndex(
         name=index_name,
         fields=fields,
@@ -123,9 +116,7 @@ def create_search_index(index_name: str):
 
 
 
-# -------------------------------
-# EMBEDDINGS
-# -------------------------------
+
 def embed_query(query: str):
     resp = openai_client.embeddings.create(
         model=EMBEDDING_MODEL,
@@ -133,51 +124,37 @@ def embed_query(query: str):
     )
     return resp.data[0].embedding
 
-# -------------------------------
-# BLOB STORAGE STREAMING & INDEXING
-# -------------------------------
+
 def make_safe_id(file_name: str, chunk_idx: int) -> str:
-    # Replace invalid characters with "_"
+    
     clean = re.sub(r'[^A-Za-z0-9_\-=:]', '_', file_name)
-
-    # Remove leading underscores
     clean = clean.lstrip("_")
-
-    # Ensure it’s not empty after cleaning
     if not clean:
         clean = "doc"
-
-    # Always prepend a prefix so it never starts invalid
     return f"doc_{clean}_chunk_{chunk_idx}"
 
 
 def make_safe_id(file_name: str, chunk_idx: int) -> str:
-    """Generate a safe document key for Azure Cognitive Search."""
-    # Replace invalid characters with "_"
+
     clean = re.sub(r'[^A-Za-z0-9_\-=:]', '_', file_name)
-    # Remove leading underscores
     clean = clean.lstrip("_")
-    # Ensure it's not empty
+    
     if not clean:
         clean = "doc"
-    # Prepend safe prefix
+    
     return f"doc_{clean}_chunk_{chunk_idx}"
 
 
 def index_all_blobs_stream(chunk_size: int = 400):
-    """
-    Stream all blobs from Azure Blob Storage, extract text using Document Intelligence,
-    and index them into Azure Cognitive Search only if not already indexed.
-    """
+    
     print("[INFO] Indexing all documents from Blob Storage (if not already indexed)...")
 
-    # Ensure index exists
+    
     create_search_index(SEARCH_INDEX)
 
     for blob in container_client.list_blobs():
         blob_name = blob.name
 
-        # Check if file is already indexed
         results = search_client.search(
             search_text=f"title:{blob_name}",
             select=["title"],
@@ -187,12 +164,11 @@ def index_all_blobs_stream(chunk_size: int = 400):
             print(f"[SKIP] Already indexed: {blob_name}")
             continue
 
-        # Download blob
+        
         blob_client = container_client.get_blob_client(blob)
         blob_data = blob_client.download_blob().readall()
         ext = os.path.splitext(blob_name)[1].lower()
 
-        # Extract text
         if ext == ".txt":
             text = blob_data.decode("utf-8")
         elif ext in [".pdf", ".png", ".jpg", ".jpeg", ".tiff"]:
@@ -208,7 +184,6 @@ def index_all_blobs_stream(chunk_size: int = 400):
             print(f"[SKIP] No text extracted from {blob_name}")
             continue
 
-        # Split into chunks and index
         words = text.split()
         for i in range(0, len(words), chunk_size):
             chunk = " ".join(words[i:i + chunk_size])
@@ -225,10 +200,6 @@ def index_all_blobs_stream(chunk_size: int = 400):
 
 
 
-
-# -------------------------------
-# RETRIEVE & GENERATE RESPONSE
-# -------------------------------
 def retrieve_similar_docs(query: str, top_k: int = TOP_K):
     query_vector = embed_query(query)
     vector_query = VectorizedQuery(
@@ -289,7 +260,6 @@ Answer:"""
 
     answer_text = completion.choices[0].message.content.strip()
 
-    # Only include references if they were cited
     used_references = [d["title"] for d in docs if d["title"] in answer_text]
 
     return {"answer": answer_text, "references": used_references}

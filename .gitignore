@@ -208,3 +208,11 @@ __marimo__/
 
 .python_packageslocal.settings.json 
 local.settings.json 
+
+
+#Audio testing
+test_audio.py
+test_STT.py
+output_audio.wav
+response_audio.wav
+test_audio.wav
