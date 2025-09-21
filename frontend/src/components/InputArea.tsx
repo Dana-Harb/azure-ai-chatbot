@@ -3,10 +3,18 @@ import { Box, TextField, IconButton, CircularProgress, Typography } from '@mui/m
 import SendIcon from '@mui/icons-material/Send';
 import MicIcon from '@mui/icons-material/Mic';
 
+interface UserData {
+  userId: string;
+  username: string;
+  role: string;
+  sessionId: string;
+}
+
 interface InputAreaProps {
   sessionId: string | null;
   setSessionId: (id: string) => void;
   addMessage: (sender: 'user' | 'bot', text: string, audioBase64?: string) => void;
+  userData: UserData | null; // Add this prop
 }
 
 // Helper function to convert audio buffer to WAV
@@ -46,7 +54,7 @@ const encodeWAV = (samples: Float32Array, sampleRate: number): ArrayBuffer => {
   return buffer;
 };
 
-const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessage }) => {
+const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessage, userData }) => {
   const [input, setInput] = useState('');
   const [recording, setRecording] = useState(false);
 
@@ -63,6 +71,7 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           session_id: sessionId,
+          user_id: userData?.userId, // ADD THIS LINE - send user ID to backend
           input_type,
           message: input_type === 'text' ? message : undefined,
           audio_base64: audioBase64,
