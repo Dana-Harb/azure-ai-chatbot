@@ -3,7 +3,8 @@ import uuid
 import bcrypt
 from datetime import datetime
 from dotenv import load_dotenv
-from azure.cosmos import CosmosClient
+from azure.cosmos import CosmosClient, exceptions
+from azure.cosmos.partition_key import PartitionKey
 import tiktoken
 
 load_dotenv() 
@@ -11,49 +12,73 @@ COSMOS_URI = os.getenv("COSMOS_URI")
 COSMOS_KEY = os.getenv("COSMOS_KEY")
 COSMOS_DB_NAME = os.getenv("COSMOS_DB_NAME")
 COSMOS_CONTAINER_NAME = os.getenv("COSMOS_CONTAINER_NAME")
+COSMOS_USERS_CONTAINER_NAME = os.getenv("COSMOS_USERS_CONTAINER_NAME", "users")
 
 client = CosmosClient(url=COSMOS_URI, credential=COSMOS_KEY)
 database = client.get_database_client(COSMOS_DB_NAME)
 container = database.get_container_client(COSMOS_CONTAINER_NAME)
+users_container = database.get_container_client(COSMOS_USERS_CONTAINER_NAME)
 
 MAX_TOKENS = 2000          
 SUMMARY_TRIGGER = 10 
 DEFAULT_SYSTEM_PROMPT = (
     "You are an expert barista with deep knowledge of coffee, brewing methods, beans, and recipes. "
-        "You have access to reference documents which may contain information relevant to the user's query. "
-        "Your goal is to provide the best answer possible: "
-        "- If the documents contain relevant information, use it. "
-        "- Supplement with your own knowledge if it adds value. "
-        "- Cite sources used, either from the documents or external knowledge. "
-        "- Provide references if the information comes from the documents. "
-        "- Provide a link to you knowlede if a relaible resource is available"
-        "- Answer in the same language as the query (Arabic or English). "
-        "- Do not fabricate references."
+    "You have access to reference documents which may contain information relevant to the user's query. "
+    "Your goal is to provide the best answer possible: "
+    "- If the documents contain relevant information, use it. "
+    "- Supplement with your own knowledge if it adds value. "
+    "- Cite sources used, either from the documents or external knowledge. "
+    "- Provide references if the information comes from the documents. "
+    "- Provide a link to you knowlede if a relaible resource is available"
+    "- Answer in the same language as the query (Arabic or English). "
+    "- Do not fabricate references."
 )
 
 # Initialize default users
 def get_user_by_username(username: str):
-    """Get user by username"""
-    query = f"SELECT * FROM c WHERE c.username = '{username}' AND c.type = 'user'"
-    users = list(container.query_items(query, enable_cross_partition_query=True))
-    return users[0] if users else None
+    """Get user by username from users container"""
+    query = "SELECT * FROM c WHERE c.username = @username"
+    params = [{"name": "@username", "value": username}]
+    
+    try:
+        users = list(users_container.query_items(
+            query=query,
+            parameters=params,
+            enable_cross_partition_query=True
+        ))
+        return users[0] if users else None
+    except Exception as e:
+        print(f"Error querying user by username: {e}")
+        return None
+
+def get_user_by_id(user_id: str):
+    """Get user by ID from users container"""
+    try:
+        user = users_container.read_item(
+            item=user_id,
+            partition_key=user_id
+        )
+        return user
+    except exceptions.CosmosResourceNotFoundError:
+        return None
+    except Exception as e:
+        print(f"Error getting user by ID: {e}")
+        return None
 
 def initialize_default_users():
     """Create default admin and client users if they don't exist"""
     try:
         # Check if admin exists
-        admin_query = "SELECT * FROM c WHERE c.username = 'admin' AND c.type = 'user'"
-        admin_exists = list(container.query_items(admin_query, enable_cross_partition_query=True))
+        admin = get_user_by_username("admin")
         
-        if not admin_exists:
+        if not admin:
             create_user("admin", "admin123", "admin")
             print("Created default admin user")
         
         # Check if client exists
-        client_query = "SELECT * FROM c WHERE c.username = 'client' AND c.type = 'user'"
-        client_exists = list(container.query_items(client_query, enable_cross_partition_query=True))
+        client_user = get_user_by_username("client")
         
-        if not client_exists:
+        if not client_user:
             create_user("client", "client123", "client")
             print("Created default client user")
             
@@ -62,34 +87,37 @@ def initialize_default_users():
 
 # User management functions
 def create_user(username: str, password: str, role: str):
-    """Create a new user with hashed password"""
+    """Create a new user with hashed password in users container"""
     hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     
     user_data = {
         "id": str(uuid.uuid4()),
+        "user_id": str(uuid.uuid4()),  # Add user_id field for partitioning
         "username": username,
         "password": hashed_password,
         "role": role,
-        "type": "user",
         "created_at": datetime.utcnow().isoformat()
     }
     
-    container.upsert_item(user_data)
-    return user_data
+    try:
+        users_container.upsert_item(user_data)
+        return user_data
+    except Exception as e:
+        print(f"Error creating user: {e}")
+        return None
 
 def authenticate_user(username: str, password: str):
-    """Authenticate user credentials"""
-    query = f"SELECT * FROM c WHERE c.username = '{username}' AND c.type = 'user'"
-    users = list(container.query_items(query, enable_cross_partition_query=True))
+    """Authenticate user credentials from users container"""
+    user = get_user_by_username(username)
     
-    if not users:
+    if not user:
         return None
     
-    user = users[0]
     if bcrypt.checkpw(password.encode('utf-8'), user['password'].encode('utf-8')):
         # Return user data without password
         return {
             "id": user["id"],
+            "user_id": user["user_id"],
             "username": user["username"],
             "role": user["role"],
             "created_at": user.get("created_at")
@@ -98,16 +126,36 @@ def authenticate_user(username: str, password: str):
     return None
 
 def get_user_sessions(user_id: str):
-    """Get all sessions for a specific user"""
-    query = f"SELECT * FROM c WHERE c.user_id = '{user_id}' AND (c.type != 'user' OR NOT IS_DEFINED(c.type))"
-    sessions = list(container.query_items(query, enable_cross_partition_query=True))
-    return sessions
+    """Get all sessions for a specific user from sessions container"""
+    query = "SELECT * FROM c WHERE c.user_id = @user_id"
+    params = [{"name": "@user_id", "value": user_id}]
+    
+    try:
+        sessions = list(container.query_items(
+            query=query,
+            parameters=params,
+            enable_cross_partition_query=True
+        ))
+        return sessions
+    except Exception as e:
+        print(f"Error querying user sessions: {e}")
+        return []
 
 def get_latest_user_session(user_id: str):
-    """Get the most recent session for a user"""
-    query = f"SELECT TOP 1 * FROM c WHERE c.user_id = '{user_id}' AND (c.type != 'user' OR NOT IS_DEFINED(c.type)) ORDER BY c._ts DESC"
-    sessions = list(container.query_items(query, enable_cross_partition_query=True))
-    return sessions[0] if sessions else None
+    """Get the most recent session for a user from sessions container"""
+    query = "SELECT TOP 1 * FROM c WHERE c.user_id = @user_id ORDER BY c._ts DESC"
+    params = [{"name": "@user_id", "value": user_id}]
+    
+    try:
+        sessions = list(container.query_items(
+            query=query,
+            parameters=params,
+            enable_cross_partition_query=True
+        ))
+        return sessions[0] if sessions else None
+    except Exception as e:
+        print(f"Error querying latest user session: {e}")
+        return None
 
 # Enhanced session functions with user association
 def create_session(system_prompt=None, user_id=None):
@@ -129,8 +177,12 @@ def create_session(system_prompt=None, user_id=None):
     if user_id:
         session_data["user_id"] = user_id
     
-    container.upsert_item(session_data)
-    return session_id
+    try:
+        container.upsert_item(session_data)
+        return session_id
+    except Exception as e:
+        print(f"Error creating session: {e}")
+        return None
 
 def get_session(session_id):
     try:
@@ -138,7 +190,17 @@ def get_session(session_id):
         if "system_prompt" not in item:
             item["system_prompt"] = DEFAULT_SYSTEM_PROMPT
         return item
-    except:
+    except exceptions.CosmosResourceNotFoundError:
+        # Session doesn't exist, create a new one
+        return {
+            "id": session_id,
+            "session_id": session_id,
+            "history": [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}],
+            "system_prompt": DEFAULT_SYSTEM_PROMPT,
+            "summary": ""
+        }
+    except Exception as e:
+        print(f"Error getting session: {e}")
         return {
             "id": session_id,
             "session_id": session_id,

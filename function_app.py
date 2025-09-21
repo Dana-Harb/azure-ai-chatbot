@@ -5,12 +5,23 @@ import base64
 from session_store import (
     create_session, get_session, update_session, clear_session, 
     authenticate_user, get_latest_user_session, get_user_by_username,
-    create_user, get_user_sessions, container
+    create_user, get_user_sessions, container, users_container,
+    get_user_by_id
 )
+import azure.functions as func
+import logging, os, json, io
+from azure.storage.blob import BlobServiceClient, ContentSettings
+from datetime import datetime
+import uuid
+
 from rag_pipeline import generate_response_with_context, index_all_blobs_stream
 from speech_interface import listen, synthesize_text_to_audio
 
+
+
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
+
+from datetime import datetime
 
 # Index documents at startup
 try:
@@ -43,20 +54,20 @@ def login(req: func.HttpRequest) -> func.HttpResponse:
         
         if user:
             # Find existing session for this user or create new one
-            existing_session = get_latest_user_session(user["id"])
+            existing_session = get_latest_user_session(user["user_id"])
             
             if existing_session:
                 session_id = existing_session["session_id"]
                 message = "Resumed existing session"
             else:
                 # Create new session associated with this user
-                session_id = create_session(user_id=user["id"])
+                session_id = create_session(user_id=user["user_id"])
                 message = "Created new session"
             
             return func.HttpResponse(
                 json.dumps({
                     "success": True,
-                    "userId": user["id"],
+                    "userId": user["user_id"],
                     "username": user["username"],
                     "role": user["role"],
                     "sessionId": session_id,
@@ -287,13 +298,24 @@ def register(req: func.HttpRequest) -> func.HttpResponse:
         # Create new user
         user = create_user(username, password, role)
         
+        if not user:
+            return func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "error": "Failed to create user"
+                }),
+                status_code=500,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+        
         # Create session for the new user
-        session_id = create_session(user_id=user["id"])
+        session_id = create_session(user_id=user["user_id"])
         
         return func.HttpResponse(
             json.dumps({
                 "success": True,
-                "userId": user["id"],
+                "userId": user["user_id"],
                 "username": user["username"],
                 "role": user["role"],
                 "sessionId": session_id,
@@ -316,7 +338,7 @@ def register(req: func.HttpRequest) -> func.HttpResponse:
             headers={"Access-Control-Allow-Origin": "*"},
         )
 
-@app.route(route="admin/users", methods=["GET", "OPTIONS"])
+@app.route(route="management/users", methods=["GET", "OPTIONS"])
 def admin_users(req: func.HttpRequest) -> func.HttpResponse:
     if req.method == "OPTIONS":
         return func.HttpResponse(
@@ -339,15 +361,19 @@ def admin_users(req: func.HttpRequest) -> func.HttpResponse:
                 headers={"Access-Control-Allow-Origin": "*"},
             )
 
-        # Get all users from Cosmos DB
-        query = "SELECT * FROM c WHERE c.type = 'user'"
-        users = list(container.query_items(query, enable_cross_partition_query=True))
+        # Get all users from users container
+        query = "SELECT * FROM c"
+        users = list(users_container.query_items(
+            query=query,
+            enable_cross_partition_query=True
+        ))
         
         # Remove password from response
         users_response = []
         for user in users:
             users_response.append({
                 "id": user["id"],
+                "user_id": user.get("user_id", user["id"]),
                 "username": user["username"],
                 "role": user["role"],
                 "created_at": user.get("created_at")
@@ -369,7 +395,7 @@ def admin_users(req: func.HttpRequest) -> func.HttpResponse:
             headers={"Access-Control-Allow-Origin": "*"},
         )
 
-@app.route(route="admin/sessions", methods=["GET", "OPTIONS"])
+@app.route(route="management/sessions", methods=["GET", "OPTIONS"])
 def admin_sessions(req: func.HttpRequest) -> func.HttpResponse:
     if req.method == "OPTIONS":
         return func.HttpResponse(
@@ -392,24 +418,39 @@ def admin_sessions(req: func.HttpRequest) -> func.HttpResponse:
                 headers={"Access-Control-Allow-Origin": "*"},
             )
 
-        # Get all sessions from Cosmos DB
-        query = "SELECT * FROM c WHERE c.type != 'user' OR NOT IS_DEFINED(c.type)"
-        sessions = list(container.query_items(query, enable_cross_partition_query=True))
+        # Get all sessions from sessions container
+        query = "SELECT * FROM c"
+        sessions = list(container.query_items(
+            query=query,
+            enable_cross_partition_query=True
+        ))
         
         # Enrich session data with user information
         sessions_response = []
         for session in sessions:
             user_info = {}
             if session.get("user_id"):
-                # Get user info for this session
-                user_query = f"SELECT * FROM c WHERE c.id = '{session['user_id']}' AND c.type = 'user'"
-                users = list(container.query_items(user_query, enable_cross_partition_query=True))
-                if users:
-                    user = users[0]
+                # Get user info from users container
+                try:
+                    user = get_user_by_id(session['user_id'])
+                    if user:
+                        user_info = {
+                            "user_id": user["user_id"],
+                            "username": user["username"],
+                            "role": user["role"]
+                        }
+                    else:
+                        user_info = {
+                            "user_id": session['user_id'],
+                            "username": "Unknown",
+                            "role": "Unknown"
+                        }
+                except Exception as e:
+                    logging.error(f"Error getting user info: {str(e)}")
                     user_info = {
-                        "user_id": user["id"],
-                        "username": user["username"],
-                        "role": user["role"]
+                        "user_id": session['user_id'],
+                        "username": "Unknown",
+                        "role": "Unknown"
                     }
             
             # Count user and assistant messages
@@ -442,7 +483,7 @@ def admin_sessions(req: func.HttpRequest) -> func.HttpResponse:
             headers={"Access-Control-Allow-Origin": "*"},
         )
 
-@app.route(route="admin/sessions/{user_id}", methods=["GET", "OPTIONS"])
+@app.route(route="management/sessions/{user_id}", methods=["GET", "OPTIONS"])
 def admin_user_sessions(req: func.HttpRequest) -> func.HttpResponse:
     if req.method == "OPTIONS":
         return func.HttpResponse(
@@ -499,8 +540,59 @@ def admin_user_sessions(req: func.HttpRequest) -> func.HttpResponse:
             headers={"Access-Control-Allow-Origin": "*"},
         )
 
+@app.route(route="management/user/{user_id}", methods=["DELETE", "OPTIONS"])
+def admin_delete_user(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return func.HttpResponse(
+            status_code=204,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "DELETE, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            },
+        )
+
+    try:
+        # Simple authentication check
+        auth_header = req.headers.get('Authorization', '')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return func.HttpResponse(
+                json.dumps({"error": "Unauthorized"}),
+                status_code=401,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+        user_id = req.route_params.get("user_id")
+        
+        # Delete user from users container
+        users_container.delete_item(item=user_id, partition_key=user_id)
+        
+        # Also delete all sessions for this user
+        sessions = get_user_sessions(user_id)
+        for session in sessions:
+            container.delete_item(item=session["id"], partition_key=session["id"])
+        
+        return func.HttpResponse(
+            json.dumps({"message": "User and associated sessions deleted successfully"}),
+            status_code=200,
+            mimetype="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+    except Exception as e:
+        logging.error(f"Admin delete user error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Internal server error"}),
+            status_code=500,
+            mimetype="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
 @app.route(route="health", methods=["GET"])
 def health_check(req: func.HttpRequest) -> func.HttpResponse:
+
+    
     """Health check endpoint"""
     return func.HttpResponse(
         json.dumps({"status": "healthy", "message": "Function app is running"}),
@@ -508,3 +600,329 @@ def health_check(req: func.HttpRequest) -> func.HttpResponse:
         mimetype="application/json",
         headers={"Access-Control-Allow-Origin": "*"},
     )
+
+@app.route(route="management/stats", methods=["GET", "OPTIONS"])
+def admin_stats(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return func.HttpResponse(
+            status_code=204,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            },
+        )
+
+    try:
+        # Simple authentication check
+        auth_header = req.headers.get('Authorization', '')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return func.HttpResponse(
+                json.dumps({"error": "Unauthorized"}),
+                status_code=401,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+        # Get user count
+        users_query = "SELECT VALUE COUNT(1) FROM c"
+        users_count = list(users_container.query_items(
+            query=users_query,
+            enable_cross_partition_query=True
+        ))[0]
+
+        # Get session count
+        sessions_query = "SELECT VALUE COUNT(1) FROM c"
+        sessions_count = list(container.query_items(
+            query=sessions_query,
+            enable_cross_partition_query=True
+        ))[0]
+
+        # Get today's messages count (approximate)
+        today = datetime.utcnow().date().isoformat()
+        messages_query = """
+        SELECT VALUE SUM(array_length(c.history)) 
+        FROM c 
+        WHERE c._ts >= TIMESTAMP_MILLIS(UNIX_MILLIS(CURRENT_TIMESTAMP) - 86400000)
+        """
+        
+        try:
+            messages_count = list(container.query_items(
+                query=messages_query,
+                enable_cross_partition_query=True
+            ))[0] or 0
+        except:
+            messages_count = 0
+
+        return func.HttpResponse(
+            json.dumps({
+                "total_users": users_count,
+                "total_sessions": sessions_count,
+                "today_messages": messages_count,
+                "active_sessions": min(sessions_count, 10)  # Simplified
+            }),
+            status_code=200,
+            mimetype="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+    except Exception as e:
+        logging.error(f"Admin stats error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Internal server error"}),
+            status_code=500,
+            mimetype="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+@app.route(route="management/user/{user_id}/role", methods=["PUT", "OPTIONS"])
+def admin_update_user_role(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return func.HttpResponse(
+            status_code=204,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "PUT, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            },
+        )
+
+    try:
+        # Simple authentication check
+        auth_header = req.headers.get('Authorization', '')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return func.HttpResponse(
+                json.dumps({"error": "Unauthorized"}),
+                status_code=401,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+        user_id = req.route_params.get("user_id")
+        req_body = req.get_json()
+        new_role = req_body.get("role")
+
+        if new_role not in ["admin", "client"]:
+            return func.HttpResponse(
+                json.dumps({"error": "Invalid role"}),
+                status_code=400,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+        # Get user and update role
+        user = get_user_by_id(user_id)
+        if not user:
+            return func.HttpResponse(
+                json.dumps({"error": "User not found"}),
+                status_code=404,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+        user["role"] = new_role
+        users_container.upsert_item(user)
+
+        return func.HttpResponse(
+            json.dumps({"message": "User role updated successfully"}),
+            status_code=200,
+            mimetype="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+    except Exception as e:
+        logging.error(f"Admin update role error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Internal server error"}),
+            status_code=500,
+            mimetype="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+    
+
+@app.route(route="management/upload", methods=["POST", "OPTIONS"])
+def admin_upload_document(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return func.HttpResponse(
+            status_code=204,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            },
+        )
+
+    try:
+     
+        auth_header = req.headers.get("Authorization", "")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            return func.HttpResponse(
+                json.dumps({"error": "Unauthorized"}),
+                status_code=401,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+ 
+        connection_string = os.getenv("BLOB_CONNECTION_STRING")
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        container_client = blob_service_client.get_container_client("documents")
+
+        file_bytes = req.get_body()
+
+
+        filename = req.headers.get("X-Filename", "upload.bin")
+        ext = os.path.splitext(filename)[1].lower()
+
+
+        allowed_extensions = [".pdf", ".txt", ".doc", ".docx", ".png", ".jpg", ".jpeg", ".tiff"]
+        if ext not in allowed_extensions:
+            return func.HttpResponse(
+                json.dumps({"error": f"Invalid file type. Allowed: {', '.join(allowed_extensions)}"}),
+                status_code=400,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = str(uuid.uuid4())[:8]
+        blob_name = f"{timestamp}_{unique_id}{ext}"
+
+        content_type_map = {
+            ".pdf": "application/pdf",
+            ".txt": "text/plain",
+            ".doc": "application/msword",
+            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".tiff": "image/tiff",
+        }
+        detected_content_type = content_type_map.get(ext, "application/octet-stream")
+
+        blob_client = container_client.get_blob_client(blob_name)
+        blob_client.upload_blob(
+            file_bytes,
+            overwrite=True,
+            content_settings=ContentSettings(content_type=detected_content_type),
+        )
+
+        return func.HttpResponse(
+            json.dumps({"message": "File uploaded", "blob_name": blob_name, "url": blob_client.url}),
+            status_code=200,
+            mimetype="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+    except Exception as e:
+        logging.error(f"Upload error: {e}")
+        return func.HttpResponse(
+            json.dumps({"error": "Internal error", "details": str(e)}),
+            status_code=500,
+            mimetype="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+
+@app.route(route="management/reindex", methods=["POST", "OPTIONS"])
+def admin_reindex(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return func.HttpResponse(
+            status_code=204,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            },
+        )
+
+    try:
+        # Simple authentication check
+        auth_header = req.headers.get('Authorization', '')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return func.HttpResponse(
+                json.dumps({"error": "Unauthorized"}),
+                status_code=401,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+        # Reindex documents
+        logging.info("Manual reindexing triggered by admin...")
+        index_all_blobs_stream()
+        
+        return func.HttpResponse(
+            json.dumps({"message": "Documents reindexed successfully"}),
+            status_code=200,
+            mimetype="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+    except Exception as e:
+        logging.error(f"Admin reindex error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Internal server error"}),
+            status_code=500,
+            mimetype="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+@app.route(route="management/session/{session_id}", methods=["GET", "OPTIONS"])
+def admin_get_session_details(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return func.HttpResponse(
+            status_code=204,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            },
+        )
+
+    try:
+        # Simple authentication check
+        auth_header = req.headers.get('Authorization', '')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return func.HttpResponse(
+                json.dumps({"error": "Unauthorized"}),
+                status_code=401,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+        session_id = req.route_params.get("session_id")
+        session = get_session(session_id)
+        
+        if not session:
+            return func.HttpResponse(
+                json.dumps({"error": "Session not found"}),
+                status_code=404,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+        # Extract only user and assistant messages
+        chat_history = [
+            {"role": msg["role"], "content": msg["content"]}
+            for msg in session.get("history", [])
+            if msg["role"] in ["user", "assistant"]
+        ]
+
+        return func.HttpResponse(
+            json.dumps({
+                "session_id": session_id,
+                "history": chat_history
+            }),
+            status_code=200,
+            mimetype="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+    except Exception as e:
+        logging.error(f"Admin session details error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Internal server error"}),
+            status_code=500,
+            mimetype="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )    

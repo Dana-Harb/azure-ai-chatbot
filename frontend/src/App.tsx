@@ -1,3 +1,4 @@
+// App.tsx
 import React, { useState, useEffect } from 'react';
 import { ThemeProvider, createTheme } from '@mui/material/styles';
 import { Typography, CircularProgress, Box } from '@mui/material';
@@ -5,6 +6,7 @@ import ChatWindow from './components/ChatWindow';
 import InputArea from './components/InputArea';
 import SoundToggle from './components/SoundToggle';
 import Login from './components/Login';
+import AdminDashboard from './components/AdminDashboard';
 
 const theme = createTheme({
   palette: {
@@ -42,7 +44,6 @@ const App: React.FC = () => {
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
 
-  // Load ONLY non-user-specific settings from localStorage on component mount
   useEffect(() => {
     const savedSoundEnabled = localStorage.getItem('soundEnabled');
     if (savedSoundEnabled !== null) {
@@ -51,7 +52,6 @@ const App: React.FC = () => {
     setIsLoading(false);
   }, []);
 
-  // Save sound settings to localStorage whenever they change
   useEffect(() => {
     localStorage.setItem('soundEnabled', soundEnabled.toString());
   }, [soundEnabled]);
@@ -72,7 +72,6 @@ const App: React.FC = () => {
       if (res.ok) {
         const data = await res.json();
         
-        // Convert backend format to frontend format
         const previousMessages: Message[] = data.history.map((msg: BackendMessage) => ({
           sender: msg.role === 'user' ? 'user' : 'bot',
           text: msg.content
@@ -80,7 +79,6 @@ const App: React.FC = () => {
         
         setMessages(previousMessages);
         
-        // Only add welcome message if it's a new session with no history
         if (previousMessages.length === 0) {
           addMessage('bot', `Welcome, ${username}! How can I help you with coffee today?`);
         } else {
@@ -89,7 +87,6 @@ const App: React.FC = () => {
       }
     } catch (error) {
       console.error('Error loading session history:', error);
-      // Show welcome message if loading fails
       addMessage('bot', `Welcome, ${username}! How can I help you with coffee today?`);
     } finally {
       setLoadingHistory(false);
@@ -97,25 +94,23 @@ const App: React.FC = () => {
   };
 
   const handleLoginSuccess = async (userData: UserData) => {
-    // Clear any previous state completely
     setMessages([]);
     setUserData(userData);
     setSessionId(userData.sessionId);
     setIsLoggedIn(true);
     
-    // Load chat history for THIS specific user
-    await loadSessionHistory(userData.sessionId, userData.username);
+    if (userData.role !== 'admin') {
+      await loadSessionHistory(userData.sessionId, userData.username);
+    }
   };
 
   const handleLogout = () => {
-    // Clear all state (don't save user data to localStorage)
     setUserData(null);
     setSessionId(null);
     setIsLoggedIn(false);
     setMessages([]);
   };
 
-  // Show loading screen while checking settings
   if (isLoading) {
     return (
       <ThemeProvider theme={theme}>
@@ -137,6 +132,14 @@ const App: React.FC = () => {
     return (
       <ThemeProvider theme={theme}>
         <Login onLoginSuccess={handleLoginSuccess} />
+      </ThemeProvider>
+    );
+  }
+
+  if (userData?.role === 'admin') {
+    return (
+      <ThemeProvider theme={theme}>
+        <AdminDashboard userData={userData} onLogout={handleLogout} />
       </ThemeProvider>
     );
   }
