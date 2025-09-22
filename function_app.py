@@ -185,7 +185,18 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
 
         user_text = None
         recognized_text = None
-
+        
+        if user_text.strip().lower() == "/clear":
+            clear_session(session_id)
+            return func.HttpResponse(
+                json.dumps({
+                    "reply": "Chat history cleared.",
+                    "session_id": session_id
+                }),
+                status_code=200,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
         # Speech input
         if input_type == "speech" and audio_base64:
             try:
