@@ -144,6 +144,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ userData, onLogout }) =
     try {
       setLoading(true);
       const res = await fetch('http://localhost:7071/api/management/reindex', {
+        method: 'POST',
         headers: { 'Authorization': `Bearer ${userData.sessionId}` }
       });
       if (res.ok) setSuccess('Documents reindexed successfully!');

@@ -8,8 +8,7 @@ from session_store import (
     create_user, get_user_sessions, container, users_container,
     get_user_by_id
 )
-import azure.functions as func
-import logging, os, json, io
+import logging, os, json
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from datetime import datetime
 import uuid
@@ -168,7 +167,7 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
         # Verify session ownership if both session_id and user_id are provided
         if session_id and user_id:
             session = get_session(session_id)
-            if session.get("user_id") and session["user_id"] != user_id:
+            if session and session.get("user_id") and session["user_id"] != user_id:
                 return func.HttpResponse(
                     json.dumps({
                         "error": "Session does not belong to this user",
@@ -186,17 +185,6 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
         user_text = None
         recognized_text = None
         
-        if user_text.strip().lower() == "/clear":
-            clear_session(session_id)
-            return func.HttpResponse(
-                json.dumps({
-                    "reply": "Chat history cleared.",
-                    "session_id": session_id
-                }),
-                status_code=200,
-                mimetype="application/json",
-                headers={"Access-Control-Allow-Origin": "*"},
-            )
         # Speech input
         if input_type == "speech" and audio_base64:
             try:
@@ -218,6 +206,19 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
         else:
             user_text = "[No input provided]"
             recognized_text = user_text
+
+        # Check for clear command AFTER user_text is set
+        if user_text and user_text.strip().lower() == "/clear":
+            clear_session(session_id)
+            return func.HttpResponse(
+                json.dumps({
+                    "reply": "Chat history cleared.",
+                    "session_id": session_id
+                }),
+                status_code=200,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
 
         # Generate RAG response
         rag_response = generate_response_with_context(user_text)
