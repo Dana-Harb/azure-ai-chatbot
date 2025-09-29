@@ -4,34 +4,89 @@ import bcrypt
 from datetime import datetime
 from dotenv import load_dotenv
 from azure.cosmos import CosmosClient, exceptions
-from azure.cosmos.partition_key import PartitionKey
+from azure.keyvault.secrets import SecretClient
+from azure.identity import DefaultAzureCredential
 import tiktoken
 
-load_dotenv() 
+load_dotenv()
+
+# --- Configuration ---
+KEYVAULT_NAME = os.getenv("KEYVAULT_NAME")
 COSMOS_URI = os.getenv("COSMOS_URI")
-COSMOS_KEY = os.getenv("COSMOS_KEY")
 COSMOS_DB_NAME = os.getenv("COSMOS_DB_NAME")
 COSMOS_CONTAINER_NAME = os.getenv("COSMOS_CONTAINER_NAME")
 COSMOS_USERS_CONTAINER_NAME = os.getenv("COSMOS_USERS_CONTAINER_NAME", "users")
 
-client = CosmosClient(url=COSMOS_URI, credential=COSMOS_KEY)
-database = client.get_database_client(COSMOS_DB_NAME)
-container = database.get_container_client(COSMOS_CONTAINER_NAME)
-users_container = database.get_container_client(COSMOS_USERS_CONTAINER_NAME)
+# --- Lazy-loaded clients and secrets ---
+_cosmos_client = None
+_container = None
+_users_container = None
+_cosmos_key = None
 
-MAX_TOKENS = 2000          
-SUMMARY_TRIGGER = 10 
+def get_cosmos_key():
+    """Lazy load Cosmos DB key from environment first, then Key Vault"""
+    global _cosmos_key
+    if _cosmos_key is None:
+        # Try environment variable first
+        _cosmos_key = os.getenv("COSMOS_KEY")
+        if _cosmos_key:
+            print("Using Cosmos key from environment variable")
+            return _cosmos_key
+            
+        print("Cosmos key not found in environment, trying Key Vault...")
+        
+        # Fall back to Key Vault
+        try:
+            keyvault_url = f"https://{KEYVAULT_NAME}.vault.azure.net/"
+            credential = DefaultAzureCredential()
+            secret_client = SecretClient(vault_url=keyvault_url, credential=credential)
+            _cosmos_key = secret_client.get_secret("COSMOS-KEY").value
+            print("✓ Successfully fetched Cosmos key from Key Vault")
+        except Exception as e:
+            print(f"Error fetching Cosmos key from Key Vault: {e}")
+            print("Make sure COSMOS_KEY is set in local.settings.json")
+            raise ValueError("Could not get Cosmos key from environment or Key Vault")
+    return _cosmos_key
+
+def get_cosmos_client():
+    """Lazy load Cosmos client"""
+    global _cosmos_client
+    if _cosmos_client is None:
+        _cosmos_client = CosmosClient(url=COSMOS_URI, credential=get_cosmos_key())
+    return _cosmos_client
+
+def get_container():
+    """Lazy load sessions container"""
+    global _container
+    if _container is None:
+        database = get_cosmos_client().get_database_client(COSMOS_DB_NAME)
+        _container = database.get_container_client(COSMOS_CONTAINER_NAME)
+    return _container
+
+def get_users_container():
+    """Lazy load users container"""
+    global _users_container
+    if _users_container is None:
+        database = get_cosmos_client().get_database_client(COSMOS_DB_NAME)
+        _users_container = database.get_container_client(COSMOS_USERS_CONTAINER_NAME)
+    return _users_container
+
+# --- Constants ---
+MAX_TOKENS = 2000
+SUMMARY_TRIGGER = 10
 DEFAULT_SYSTEM_PROMPT = (
     "You are an expert barista with deep knowledge of coffee, brewing methods, beans, and recipes. "
     "You have access to reference documents which may contain information relevant to the user's query. "
-    "Your goal is to provide the best answer possible: "
-    "- If the documents contain relevant information, use it. "
+    "Your goal is to provide concise, helpful answers: "
+    "- Keep responses brief and to the point (2-3 sentences maximum)"
+    "- If the documents contain relevant information, use it briefly. "
     "- Supplement with your own knowledge if it adds value. "
     "- Cite sources used, either from the documents or external knowledge. "
     "- Provide references if the information comes from the documents. "
-    "- Provide a link to you knowlede if a relaible resource is available"
+    "- Provide a link to reliable resources if available. "
     "- Answer in the same language as the query (Arabic or English). "
     "- Do not fabricate references."
+    "- Be concise and avoid unnecessary details."
 )
 
 # Initialize default users
@@ -41,7 +96,7 @@ def get_user_by_username(username: str):
     params = [{"name": "@username", "value": username}]
     
     try:
-        users = list(users_container.query_items(
+        users = list(get_users_container().query_items(
             query=query,
             parameters=params,
             enable_cross_partition_query=True
@@ -54,7 +109,7 @@ def get_user_by_username(username: str):
 def get_user_by_id(user_id: str):
     """Get user by ID from users container"""
     try:
-        user = users_container.read_item(
+        user = get_users_container().read_item(
             item=user_id,
             partition_key=user_id
         )
@@ -100,7 +155,7 @@ def create_user(username: str, password: str, role: str):
     }
     
     try:
-        users_container.upsert_item(user_data)
+        get_users_container().upsert_item(user_data)
         return user_data
     except Exception as e:
         print(f"Error creating user: {e}")
@@ -131,7 +186,7 @@ def get_user_sessions(user_id: str):
     params = [{"name": "@user_id", "value": user_id}]
     
     try:
-        sessions = list(container.query_items(
+        sessions = list(get_container().query_items(
             query=query,
             parameters=params,
             enable_cross_partition_query=True
@@ -147,7 +202,7 @@ def get_latest_user_session(user_id: str):
     params = [{"name": "@user_id", "value": user_id}]
     
     try:
-        sessions = list(container.query_items(
+        sessions = list(get_container().query_items(
             query=query,
             parameters=params,
             enable_cross_partition_query=True
@@ -178,7 +233,7 @@ def create_session(system_prompt=None, user_id=None):
         session_data["user_id"] = user_id
     
     try:
-        container.upsert_item(session_data)
+        get_container().upsert_item(session_data)
         return session_id
     except Exception as e:
         print(f"Error creating session: {e}")
@@ -186,7 +241,7 @@ def create_session(system_prompt=None, user_id=None):
 
 def get_session(session_id):
     try:
-        item = container.read_item(item=session_id, partition_key=session_id)
+        item = get_container().read_item(item=session_id, partition_key=session_id)
         if "system_prompt" not in item:
             item["system_prompt"] = DEFAULT_SYSTEM_PROMPT
         return item
@@ -213,7 +268,7 @@ def clear_session(session_id):
     session = get_session(session_id)
     session["history"] = [{"role": "system", "content": session.get("system_prompt", DEFAULT_SYSTEM_PROMPT)}]
     session["summary"] = ""
-    container.upsert_item(session)
+    get_container().upsert_item(session)
 
 def count_tokens(messages):
     encoding = tiktoken.encoding_for_model("gpt-4o")
@@ -239,7 +294,7 @@ def summarize_messages(messages, client_openai=None, deployment=None):
         completion = client_openai.chat.completions.create(
             model=deployment,
             messages=summary_prompt,
-            max_tokens=500,
+            max_tokens=150,
             temperature=0.7
         )
         summary_text = completion.choices[0].message.content.strip()
@@ -278,8 +333,13 @@ def update_session(session_id, user_message, bot_response, user_id=None, client_
 
     session["history"] = history
     session["summary"] = summary
-    container.upsert_item(session)
+    get_container().upsert_item(session)
     return history
 
 # Initialize default users when this module is imported
-initialize_default_users()
+# But only if we can connect to Cosmos DB
+try:
+    initialize_default_users()
+except Exception as e:
+    print(f"Could not initialize default users during import: {e}")
+    print("This is normal if Key Vault authentication fails during import")

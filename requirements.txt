@@ -12,6 +12,9 @@ azure-ai-documentintelligence
 azure-storage-blob
 azure-cognitiveservices-speech
 bcrypt>=4.0.0
+azure-identity
+azure-keyvault-secrets
+requests
 
 
 

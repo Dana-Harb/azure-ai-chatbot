@@ -5,8 +5,8 @@ import base64
 from session_store import (
     create_session, get_session, update_session, clear_session, 
     authenticate_user, get_latest_user_session, get_user_by_username,
-    create_user, get_user_sessions, container, users_container,
-    get_user_by_id
+    create_user, get_user_sessions, get_user_by_id,
+    get_container, get_users_container
 )
 import logging, os, json
 from azure.storage.blob import BlobServiceClient, ContentSettings
@@ -16,19 +16,16 @@ import uuid
 from rag_pipeline import generate_response_with_context, index_all_blobs_stream
 from speech_interface import listen, synthesize_text_to_audio
 
-
+from azure.identity import DefaultAzureCredential
+from azure.keyvault.secrets import SecretClient
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 from datetime import datetime
 
-# Index documents at startup
-try:
-    logging.info("Indexing all documents from Blob Storage...")
-    index_all_blobs_stream()
-    logging.info("Blob indexing completed.")
-except Exception as e:
-    logging.error(f"Blob indexing failed at startup: {str(e)}")
+# Comment out startup indexing to avoid Key Vault issues during import
+# Indexing will happen on first request or via admin endpoint
+logging.info("Function app started - lazy loading enabled")
 
 @app.route(route="login", methods=["POST", "OPTIONS"])
 def login(req: func.HttpRequest) -> func.HttpResponse:
@@ -375,7 +372,7 @@ def admin_users(req: func.HttpRequest) -> func.HttpResponse:
 
         # Get all users from users container
         query = "SELECT * FROM c"
-        users = list(users_container.query_items(
+        users = list(get_users_container().query_items(
             query=query,
             enable_cross_partition_query=True
         ))
@@ -432,7 +429,7 @@ def admin_sessions(req: func.HttpRequest) -> func.HttpResponse:
 
         # Get all sessions from sessions container
         query = "SELECT * FROM c"
-        sessions = list(container.query_items(
+        sessions = list(get_container().query_items(
             query=query,
             enable_cross_partition_query=True
         ))
@@ -578,12 +575,12 @@ def admin_delete_user(req: func.HttpRequest) -> func.HttpResponse:
         user_id = req.route_params.get("user_id")
         
         # Delete user from users container
-        users_container.delete_item(item=user_id, partition_key=user_id)
+        get_users_container().delete_item(item=user_id, partition_key=user_id)
         
         # Also delete all sessions for this user
         sessions = get_user_sessions(user_id)
         for session in sessions:
-            container.delete_item(item=session["id"], partition_key=session["id"])
+            get_container().delete_item(item=session["id"], partition_key=session["id"])
         
         return func.HttpResponse(
             json.dumps({"message": "User and associated sessions deleted successfully"}),
@@ -603,8 +600,6 @@ def admin_delete_user(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="health", methods=["GET"])
 def health_check(req: func.HttpRequest) -> func.HttpResponse:
-
-    
     """Health check endpoint"""
     return func.HttpResponse(
         json.dumps({"status": "healthy", "message": "Function app is running"}),
@@ -638,19 +633,18 @@ def admin_stats(req: func.HttpRequest) -> func.HttpResponse:
 
         # Get user count
         users_query = "SELECT VALUE COUNT(1) FROM c"
-        users_count = list(users_container.query_items(
+        users_count = list(get_users_container().query_items(
             query=users_query,
             enable_cross_partition_query=True
         ))[0]
 
         # Get session count
         sessions_query = "SELECT VALUE COUNT(1) FROM c"
-        sessions_count = list(container.query_items(
+        sessions_count = list(get_container().query_items(
             query=sessions_query,
             enable_cross_partition_query=True
         ))[0]
 
-        # Get today's messages count (approximate)
         today = datetime.utcnow().date().isoformat()
         messages_query = """
         SELECT VALUE SUM(array_length(c.history)) 
@@ -659,7 +653,7 @@ def admin_stats(req: func.HttpRequest) -> func.HttpResponse:
         """
         
         try:
-            messages_count = list(container.query_items(
+            messages_count = list(get_container().query_items(
                 query=messages_query,
                 enable_cross_partition_query=True
             ))[0] or 0
@@ -733,7 +727,7 @@ def admin_update_user_role(req: func.HttpRequest) -> func.HttpResponse:
             )
 
         user["role"] = new_role
-        users_container.upsert_item(user)
+        get_users_container().upsert_item(user)
 
         return func.HttpResponse(
             json.dumps({"message": "User role updated successfully"}),
@@ -765,7 +759,6 @@ def admin_upload_document(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     try:
-     
         auth_header = req.headers.get("Authorization", "")
         if not auth_header or not auth_header.startswith("Bearer "):
             return func.HttpResponse(
@@ -775,18 +768,28 @@ def admin_upload_document(req: func.HttpRequest) -> func.HttpResponse:
                 headers={"Access-Control-Allow-Origin": "*"},
             )
 
- 
-        connection_string = os.getenv("BLOB_CONNECTION_STRING")
+        keyvault_name = os.getenv("KEYVAULT_NAME")
+        if not keyvault_name:
+            raise ValueError("KEYVAULT_NAME environment variable is not set")
+
+        keyvault_url = f"https://{keyvault_name}.vault.azure.net/"
+        credential = DefaultAzureCredential()
+        secret_client = SecretClient(vault_url=keyvault_url, credential=credential)
+
+        
+        secret_name = "BLOB-CONNECTION-STRING"  
+        connection_string = secret_client.get_secret(secret_name).value
+
+       
         blob_service_client = BlobServiceClient.from_connection_string(connection_string)
         container_client = blob_service_client.get_container_client("documents")
 
+        
         file_bytes = req.get_body()
-
-
         filename = req.headers.get("X-Filename", "upload.bin")
         ext = os.path.splitext(filename)[1].lower()
 
-
+        
         allowed_extensions = [".pdf", ".txt", ".doc", ".docx", ".png", ".jpg", ".jpeg", ".tiff"]
         if ext not in allowed_extensions:
             return func.HttpResponse(
@@ -796,10 +799,12 @@ def admin_upload_document(req: func.HttpRequest) -> func.HttpResponse:
                 headers={"Access-Control-Allow-Origin": "*"},
             )
 
+        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         unique_id = str(uuid.uuid4())[:8]
         blob_name = f"{timestamp}_{unique_id}{ext}"
 
+        
         content_type_map = {
             ".pdf": "application/pdf",
             ".txt": "text/plain",
@@ -812,6 +817,7 @@ def admin_upload_document(req: func.HttpRequest) -> func.HttpResponse:
         }
         detected_content_type = content_type_map.get(ext, "application/octet-stream")
 
+        
         blob_client = container_client.get_blob_client(blob_name)
         blob_client.upload_blob(
             file_bytes,
@@ -937,4 +943,4 @@ def admin_get_session_details(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json",
             headers={"Access-Control-Allow-Origin": "*"},
-        )    
+        )

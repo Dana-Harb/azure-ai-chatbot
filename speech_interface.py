@@ -3,11 +3,44 @@ import os
 from dotenv import load_dotenv
 import logging
 import json
+from azure.identity import DefaultAzureCredential
+from azure.keyvault.secrets import SecretClient
 
 load_dotenv()
 
-SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
 SERVICE_REGION = os.getenv("AZURE_SPEECH_REGION")
+KEYVAULT_NAME = os.getenv("KEYVAULT_NAME")
+
+# Cache for speech key
+_speech_key = None
+
+def get_speech_key():
+    """Lazy load speech key from environment first, then Key Vault"""
+    global _speech_key
+    if _speech_key is None:
+        # Try environment variable first
+        _speech_key = os.getenv("AZURE_SPEECH_KEY")
+        if _speech_key:
+            print("Using Speech key from environment variable")
+            return _speech_key
+            
+        print("Speech key not found in environment, trying Key Vault...")
+        
+        # Fall back to Key Vault
+        if not KEYVAULT_NAME:
+            raise ValueError("KEYVAULT_NAME is not set in environment variables")
+        
+        try:
+            keyvault_url = f"https://{KEYVAULT_NAME}.vault.azure.net/"
+            credential = DefaultAzureCredential()
+            secret_client = SecretClient(vault_url=keyvault_url, credential=credential)
+            _speech_key = secret_client.get_secret("AZURE-SPEECH-KEY").value
+            print(" Successfully fetched Speech key from Key Vault")
+        except Exception as e:
+            print(f" Error fetching Speech key from Key Vault: {e}")
+            print(" Make sure AZURE_SPEECH_KEY is set in local.settings.json")
+            raise ValueError("Could not get Speech key from environment or Key Vault")
+    return _speech_key
 
 def listen(audio_bytes=None):
     """
@@ -22,26 +55,21 @@ def listen(audio_bytes=None):
         
         # Headers
         headers = {
-            "Ocp-Apim-Subscription-Key": SPEECH_KEY,
+            "Ocp-Apim-Subscription-Key": get_speech_key(),  # Use getter function
             "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=16000",
             "Accept": "application/json"
         }
         
-        # Parameters
-        params = {
-            "language": "en-US",
-            "format": "detailed"
-        }
+        params = {"language": "en-US", "format": "detailed"}
         
-        # Send request
         response = requests.post(url, headers=headers, params=params, data=audio_bytes)
         
         if response.status_code == 200:
             result = response.json()
-            if result["RecognitionStatus"] == "Success":
-                return result["DisplayText"]
+            if result.get("RecognitionStatus") == "Success":
+                return result.get("DisplayText", "")
             else:
-                return f"Recognition failed: {result['RecognitionStatus']}"
+                return f"Recognition failed: {result.get('RecognitionStatus')}"
         else:
             return f"API error: {response.status_code} - {response.text}"
             
@@ -57,17 +85,14 @@ def synthesize_text_to_audio(text: str):
         return None
         
     try:
-        # API endpoint
         url = f"https://{SERVICE_REGION}.tts.speech.microsoft.com/cognitiveservices/v1"
         
-        # Headers
         headers = {
-            "Ocp-Apim-Subscription-Key": SPEECH_KEY,
+            "Ocp-Apim-Subscription-Key": get_speech_key(),  # Use getter function
             "Content-Type": "application/ssml+xml",
             "X-Microsoft-OutputFormat": "riff-16khz-16bit-mono-pcm"
         }
         
-        # SSML payload
         ssml = f"""
         <speak version='1.0' xml:lang='en-US'>
             <voice name='en-US-JennyNeural'>
@@ -76,7 +101,6 @@ def synthesize_text_to_audio(text: str):
         </speak>
         """
         
-        # Send request
         response = requests.post(url, headers=headers, data=ssml.encode('utf-8'))
         
         if response.status_code == 200:
