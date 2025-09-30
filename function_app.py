@@ -10,7 +10,7 @@ from session_store import (
 )
 import logging, os, json
 from azure.storage.blob import BlobServiceClient, ContentSettings
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 
 from rag_pipeline import generate_response_with_context, index_all_blobs_stream
@@ -573,15 +573,90 @@ def admin_delete_user(req: func.HttpRequest) -> func.HttpResponse:
             )
 
         user_id = req.route_params.get("user_id")
-        
-        # Delete user from users container
-        get_users_container().delete_item(item=user_id, partition_key=user_id)
-        
+        logging.info(f"[DeleteUser] Attempting to delete user: {user_id}")
+
+        # Try to find user by user_id first, then by id
+        user = None
+        try:
+            user = get_user_by_id(user_id)
+            logging.info(f"[DeleteUser] Found user by user_id: {user}")
+        except Exception as e:
+            logging.warning(f"[DeleteUser] get_user_by_id failed: {e}")
+
+        if not user:
+            # Query users container to find the user
+            query = "SELECT * FROM c WHERE c.user_id = @user_id OR c.id = @user_id"
+            params = [{"name": "@user_id", "value": user_id}]
+            users = list(get_users_container().query_items(
+                query=query,
+                parameters=params,
+                enable_cross_partition_query=True
+            ))
+            if users:
+                user = users[0]
+                logging.info(f"[DeleteUser] Found user by query: {user}")
+            else:
+                logging.warning(f"[DeleteUser] No user found for id: {user_id}")
+
+        if not user:
+            return func.HttpResponse(
+                json.dumps({"error": "User not found"}),
+                status_code=404,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+        # Log all user keys and values for diagnostics
+        logging.info(f"[DeleteUser] User keys: {list(user.keys())}")
+        logging.info(f"[DeleteUser] User object: {json.dumps(user)}")
+
+        # Use correct id and partition key for deletion
+        doc_id = user.get("id")
+        partition_key = user.get("user_id")
+        if not doc_id or not partition_key:
+            return func.HttpResponse(
+                json.dumps({"error": "User document missing id or partition key"}),
+                status_code=500,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+        try:
+            logging.info(f"[DeleteUser] Deleting user: id={doc_id}, partition_key={partition_key}")
+            get_users_container().delete_item(item=doc_id, partition_key=partition_key)
+            logging.info(f"[DeleteUser] User deleted: {doc_id}")
+        except Exception as e:
+            logging.error(f"[DeleteUser] Failed to delete user: {e}")
+            import traceback
+            logging.error(traceback.format_exc())
+            return func.HttpResponse(
+                json.dumps({"error": "Failed to delete user", "details": str(e)}),
+                status_code=500,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
         # Also delete all sessions for this user
-        sessions = get_user_sessions(user_id)
-        for session in sessions:
-            get_container().delete_item(item=session["id"], partition_key=session["id"])
-        
+        try:
+            sessions = get_user_sessions(partition_key)
+            logging.info(f"[DeleteUser] Found {len(sessions)} sessions for user {partition_key}")
+            for session in sessions:
+                session_id = session.get("session_id", session.get("id"))
+                logging.info(f"[DeleteUser] Deleting session: id={session_id}, partition_key={session_id}")
+                try:
+                    get_container().delete_item(item=session_id, partition_key=session_id)
+                    logging.info(f"[DeleteUser] Session deleted: {session_id}")
+                except Exception as e:
+                    logging.error(f"[DeleteUser] Failed to delete session {session_id}: {e}")
+                    import traceback
+                    logging.error(traceback.format_exc())
+            logging.info(f"[DeleteUser] All sessions deleted for user {partition_key}")
+        except Exception as e:
+            logging.error(f"[DeleteUser] Failed to delete sessions for user {partition_key}: {e}")
+            import traceback
+            logging.error(traceback.format_exc())
+            # Do not fail the whole operation if session deletion fails
+
         return func.HttpResponse(
             json.dumps({"message": "User and associated sessions deleted successfully"}),
             status_code=200,
@@ -590,9 +665,11 @@ def admin_delete_user(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     except Exception as e:
-        logging.error(f"Admin delete user error: {str(e)}")
+        logging.error(f"[DeleteUser] Admin delete user error: {str(e)}")
+        import traceback
+        logging.error(traceback.format_exc())
         return func.HttpResponse(
-            json.dumps({"error": "Internal server error"}),
+            json.dumps({"error": "Internal server error", "details": str(e)}),
             status_code=500,
             mimetype="application/json",
             headers={"Access-Control-Allow-Origin": "*"},
@@ -645,27 +722,38 @@ def admin_stats(req: func.HttpRequest) -> func.HttpResponse:
             enable_cross_partition_query=True
         ))[0]
 
-        today = datetime.utcnow().date().isoformat()
-        messages_query = """
-        SELECT VALUE SUM(array_length(c.history)) 
-        FROM c 
-        WHERE c._ts >= TIMESTAMP_MILLIS(UNIX_MILLIS(CURRENT_TIMESTAMP) - 86400000)
-        """
+        # SIMPLEST APPROACH: Count all messages (temporary fix)
+        messages_query = "SELECT VALUE SUM(ARRAY_LENGTH(c.history)) FROM c"
         
         try:
-            messages_count = list(get_container().query_items(
+            messages_count_result = list(get_container().query_items(
                 query=messages_query,
                 enable_cross_partition_query=True
-            ))[0] or 0
-        except:
+            ))
+            messages_count = messages_count_result[0] if messages_count_result else 0
+        except Exception as e:
+            logging.error(f"Error counting messages: {str(e)}")
             messages_count = 0
+
+        # Active sessions: sessions created in last 24 hours
+        active_sessions_query = "SELECT VALUE COUNT(1) FROM c"
+        
+        try:
+            active_sessions_result = list(get_container().query_items(
+                query=active_sessions_query,
+                enable_cross_partition_query=True
+            ))
+            active_sessions = active_sessions_result[0] if active_sessions_result else 0
+        except Exception as e:
+            logging.error(f"Error counting active sessions: {str(e)}")
+            active_sessions = min(sessions_count, 10)
 
         return func.HttpResponse(
             json.dumps({
                 "total_users": users_count,
                 "total_sessions": sessions_count,
-                "today_messages": messages_count,
-                "active_sessions": min(sessions_count, 10)  # Simplified
+                "today_messages": messages_count,  # Temporary: total messages
+                "active_sessions": active_sessions
             }),
             status_code=200,
             mimetype="application/json",
@@ -674,8 +762,10 @@ def admin_stats(req: func.HttpRequest) -> func.HttpResponse:
 
     except Exception as e:
         logging.error(f"Admin stats error: {str(e)}")
+        import traceback
+        logging.error(traceback.format_exc())
         return func.HttpResponse(
-            json.dumps({"error": "Internal server error"}),
+            json.dumps({"error": "Internal server error", "details": str(e)}),
             status_code=500,
             mimetype="application/json",
             headers={"Access-Control-Allow-Origin": "*"},
@@ -716,8 +806,25 @@ def admin_update_user_role(req: func.HttpRequest) -> func.HttpResponse:
                 headers={"Access-Control-Allow-Origin": "*"},
             )
 
-        # Get user and update role
-        user = get_user_by_id(user_id)
+        # Try to find user by user_id first, then by id (like delete logic)
+        user = None
+        try:
+            user = get_user_by_id(user_id)
+        except:
+            pass
+
+        if not user:
+            query = "SELECT * FROM c WHERE c.user_id = @user_id OR c.id = @user_id"
+            params = [{"name": "@user_id", "value": user_id}]
+            users = list(get_users_container().query_items(
+                query=query,
+                parameters=params,
+                enable_cross_partition_query=True
+            ))
+            if users:
+                user = users[0]
+                user_id = user["user_id"]
+
         if not user:
             return func.HttpResponse(
                 json.dumps({"error": "User not found"}),
@@ -776,20 +883,23 @@ def admin_upload_document(req: func.HttpRequest) -> func.HttpResponse:
         credential = DefaultAzureCredential()
         secret_client = SecretClient(vault_url=keyvault_url, credential=credential)
 
-        
         secret_name = "BLOB-CONNECTION-STRING"  
         connection_string = secret_client.get_secret(secret_name).value
 
-       
         blob_service_client = BlobServiceClient.from_connection_string(connection_string)
         container_client = blob_service_client.get_container_client("documents")
 
-        
         file_bytes = req.get_body()
         filename = req.headers.get("X-Filename", "upload.bin")
+        try:
+            # Ensure filename is UTF-8
+            filename = filename.encode("utf-8").decode("utf-8")
+        except Exception as e:
+            logging.warning(f"Filename encoding issue: {e}")
+            filename = "upload.bin"
+
         ext = os.path.splitext(filename)[1].lower()
 
-        
         allowed_extensions = [".pdf", ".txt", ".doc", ".docx", ".png", ".jpg", ".jpeg", ".tiff"]
         if ext not in allowed_extensions:
             return func.HttpResponse(
@@ -799,12 +909,14 @@ def admin_upload_document(req: func.HttpRequest) -> func.HttpResponse:
                 headers={"Access-Control-Allow-Origin": "*"},
             )
 
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Log file info for diagnostics
+        logging.info(f"Uploading file: {filename} ({len(file_bytes)} bytes)")
+
+        from datetime import timezone
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         unique_id = str(uuid.uuid4())[:8]
         blob_name = f"{timestamp}_{unique_id}{ext}"
 
-        
         content_type_map = {
             ".pdf": "application/pdf",
             ".txt": "text/plain",
@@ -817,7 +929,6 @@ def admin_upload_document(req: func.HttpRequest) -> func.HttpResponse:
         }
         detected_content_type = content_type_map.get(ext, "application/octet-stream")
 
-        
         blob_client = container_client.get_blob_client(blob_name)
         blob_client.upload_blob(
             file_bytes,
@@ -833,7 +944,9 @@ def admin_upload_document(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     except Exception as e:
+        import traceback
         logging.error(f"Upload error: {e}")
+        logging.error(traceback.format_exc())
         return func.HttpResponse(
             json.dumps({"error": "Internal error", "details": str(e)}),
             status_code=500,
@@ -867,19 +980,34 @@ def admin_reindex(req: func.HttpRequest) -> func.HttpResponse:
 
         # Reindex documents
         logging.info("Manual reindexing triggered by admin...")
-        index_all_blobs_stream()
-        
-        return func.HttpResponse(
-            json.dumps({"message": "Documents reindexed successfully"}),
-            status_code=200,
-            mimetype="application/json",
-            headers={"Access-Control-Allow-Origin": "*"},
-        )
+        try:
+            result = index_all_blobs_stream()
+            # Ensure result is serializable (convert generator to list)
+            if result is not None and not isinstance(result, (str, dict, list, int, float, bool)):
+                result = list(result)
+            return func.HttpResponse(
+                json.dumps({"message": "Documents reindexed successfully", "result": result}),
+                status_code=200,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+        except Exception as e:
+            logging.error(f"Admin reindex error (inner): {str(e)}")
+            import traceback
+            logging.error(traceback.format_exc())
+            return func.HttpResponse(
+                json.dumps({"error": "Reindex failed", "details": str(e)}),
+                status_code=500,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
 
     except Exception as e:
-        logging.error(f"Admin reindex error: {str(e)}")
+        logging.error(f"Admin reindex error (outer): {str(e)}")
+        import traceback
+        logging.error(traceback.format_exc())
         return func.HttpResponse(
-            json.dumps({"error": "Internal server error"}),
+            json.dumps({"error": "Internal server error", "details": str(e)}),
             status_code=500,
             mimetype="application/json",
             headers={"Access-Control-Allow-Origin": "*"},

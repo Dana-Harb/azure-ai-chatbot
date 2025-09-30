@@ -149,11 +149,11 @@ const UsersTable: React.FC<UsersTableProps> = ({ userData, onUserUpdate }) => {
           <Table>
             <TableHead>
               <TableRow color='#3e2723'>
-                <TableCell>Username</TableCell>
-                <TableCell>Role</TableCell>
-                <TableCell>User ID</TableCell>
-                <TableCell>Created At</TableCell>
-                <TableCell>Actions</TableCell>
+                <TableCell sx={{ color: '#3e2723', fontWeight: 'bold' }}>Username</TableCell>
+                <TableCell sx={{ color: '#3e2723', fontWeight: 'bold' }}>Role</TableCell>
+                <TableCell sx={{ color: '#3e2723', fontWeight: 'bold' }}>User ID</TableCell>
+                <TableCell sx={{ color: '#3e2723', fontWeight: 'bold' }}>Created At</TableCell>
+                <TableCell sx={{ color: '#3e2723', fontWeight: 'bold' }}>Actions</TableCell>
               </TableRow>
             </TableHead>
             <TableBody>
@@ -196,9 +196,9 @@ const UsersTable: React.FC<UsersTableProps> = ({ userData, onUserUpdate }) => {
 
         {/* Delete Confirmation Dialog */}
         <Dialog open={deleteDialogOpen} onClose={() => setDeleteDialogOpen(false)}>
-          <DialogTitle>Delete User</DialogTitle>
+          <DialogTitle sx={{ color: '#3e2723', fontWeight: 'bold' }}>Delete User</DialogTitle>
           <DialogContent>
-            <Typography>
+            <Typography sx={{ color: '#3e2723', fontWeight: 'bold' }}>
               Are you sure you want to delete user "{selectedUser?.username}"? This will also delete all their sessions.
             </Typography>
           </DialogContent>
@@ -212,7 +212,7 @@ const UsersTable: React.FC<UsersTableProps> = ({ userData, onUserUpdate }) => {
 
         {/* Edit User Dialog */}
         <Dialog open={editDialogOpen} onClose={() => setEditDialogOpen(false)}>
-          <DialogTitle>Edit User Role</DialogTitle>
+          <DialogTitle sx={{ color: '#3e2723', fontWeight: 'bold' }}>Edit User Role</DialogTitle>
           <DialogContent>
             <TextField
               select
@@ -222,8 +222,8 @@ const UsersTable: React.FC<UsersTableProps> = ({ userData, onUserUpdate }) => {
               onChange={(e) => setNewRole(e.target.value)}
               sx={{ mt: 2 }}
             >
-              <MenuItem value="admin">Admin</MenuItem>
-              <MenuItem value="client">Client</MenuItem>
+              <MenuItem sx={{ color: '#3e2723', fontWeight: 'bold' }} value="admin">Admin</MenuItem>
+              <MenuItem sx={{ color: '#3e2723', fontWeight: 'bold' }} value="client">Client</MenuItem>
             </TextField>
           </DialogContent>
           <DialogActions>

@@ -239,8 +239,8 @@ const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({ userData }) => 
           )}
 
           {/* Debug information */}
-          <Box sx={{ mt: 3, p: 2, backgroundColor: '#f0f0f0', borderRadius: 1 }}>
-            <Typography variant="body2" fontWeight="bold" gutterBottom>
+          <Box sx={{ mt: 3, p: 2, backgroundColor: '#f0f0f0', borderRadius: 1 ,color: '#3e2723', fontWeight: 'bold'}}>
+            <Typography variant="body2" fontWeight="bold" gutterBottom >
               Debug Information:
             </Typography>
             <Typography variant="caption" component="div">

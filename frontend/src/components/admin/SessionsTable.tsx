@@ -115,13 +115,13 @@ const SessionsTable: React.FC<SessionsTableProps> = ({ userData }) => {
           <Table>
             <TableHead>
               <TableRow >
-                <TableCell color='#3e2723'>Session ID</TableCell>
-                <TableCell color='#3e2723'>Username</TableCell>
-                <TableCell color='#3e2723'>Role</TableCell>
-                <TableCell color='#3e2723'>Messages</TableCell>
-                <TableCell color='#3e2723'>Created</TableCell>
-                <TableCell color='#3e2723'>Last Updated</TableCell>
-                <TableCell color='#3e2723'>Actions</TableCell>
+                <TableCell sx={{ color: '#3e2723', fontWeight: 'bold' }}>Session ID</TableCell>
+                <TableCell sx={{ color: '#3e2723', fontWeight: 'bold' }}>Username</TableCell>
+                <TableCell sx={{ color: '#3e2723', fontWeight: 'bold' }}>Role</TableCell>
+                <TableCell sx={{ color: '#3e2723', fontWeight: 'bold' }}>Messages</TableCell>
+                <TableCell sx={{ color: '#3e2723', fontWeight: 'bold' }}>Created</TableCell>
+                <TableCell sx={{ color: '#3e2723', fontWeight: 'bold' }}>Last Updated</TableCell>
+                <TableCell sx={{ color: '#3e2723', fontWeight: 'bold' }}>Actions</TableCell>
               </TableRow>
             </TableHead>
             <TableBody>
@@ -156,25 +156,25 @@ const SessionsTable: React.FC<SessionsTableProps> = ({ userData }) => {
           maxWidth="md"
           fullWidth
         >
-          <DialogTitle>Session Details</DialogTitle>
+          <DialogTitle sx={{ color: '#3e2723', fontWeight: 'bold' }}>Session Details</DialogTitle>
           <DialogContent>
             {selectedSession && (
               <Box>
-                <Typography variant="h6" gutterBottom>
+                <Typography variant="h6" gutterBottom sx={{ color: '#3e2723', fontWeight: 'bold' }}>
                   Chat History
                 </Typography>
                 {selectedSession.history.map((msg, index) => (
                   <Paper
-                    key={index}
-                    sx={{
-                      p: 1,
-                      mb: 1,
-                      backgroundColor: msg.role === 'user' ? '#e3f2fd' : '#f3e5f5'
-                    }}
-                  >
-                    <Typography variant="body2">
-                      <strong>{msg.role}:</strong> {msg.content}
-                    </Typography>
+                        key={index}
+                        sx={{
+                          p: 1,
+                          mb: 1,
+                          backgroundColor: msg.role === 'user' ? '#e3f2fd' : '#f3e5f5'
+                        }}
+                      >
+                        <Typography variant="body2" sx={{ color: '#1a1a1a' }}>
+                          <strong>{msg.role}:</strong> {msg.content}
+                        </Typography>
                   </Paper>
                 ))}
               </Box>

@@ -20,6 +20,9 @@ from azure.storage.blob import BlobServiceClient
 from azure.keyvault.secrets import SecretClient
 from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
+import sys
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 load_dotenv()
 
@@ -251,51 +254,61 @@ def make_safe_id(file_name: str, chunk_idx: int) -> str:
 def index_all_blobs_stream(chunk_size: int = 400):
     print("[INFO] Indexing all documents from Blob Storage (if not already indexed)...")
     create_search_index(SEARCH_INDEX)
+    summary = []
 
     for blob in get_container_client().list_blobs():
         blob_name = blob.name
+        try:
+            results = get_search_client().search(
+                search_text=f"title:{blob_name}",
+                select=["title"],
+                top=1
+            )
+            if any(True for _ in results):
+                print(f"[SKIP] Already indexed: {blob_name}")
+                summary.append({"file": blob_name, "status": "skipped"})
+                continue
 
-        results = get_search_client().search(
-            search_text=f"title:{blob_name}",
-            select=["title"],
-            top=1
-        )
-        if any(True for _ in results):
-            print(f"[SKIP] Already indexed: {blob_name}")
-            continue
+            blob_client = get_container_client().get_blob_client(blob)
+            blob_data = blob_client.download_blob().readall()
+            ext = os.path.splitext(blob_name)[1].lower()
 
-        blob_client = get_container_client().get_blob_client(blob)
-        blob_data = blob_client.download_blob().readall()
-        ext = os.path.splitext(blob_name)[1].lower()
+            if ext == ".txt":
+                text = blob_data.decode("utf-8")
+            elif ext in [".pdf", ".png", ".jpg", ".jpeg", ".tiff"]:
+                poller = get_doc_client().begin_analyze_document("prebuilt-read", body=blob_data)
+                result = poller.result()
+                text = "\n".join([line.content for page in result.pages for line in page.lines])
+            else:
+                print(f"[SKIP] Unsupported file type: {blob_name}")
+                summary.append({"file": blob_name, "status": "unsupported"})
+                continue
 
-        if ext == ".txt":
-            text = blob_data.decode("utf-8")
-        elif ext in [".pdf", ".png", ".jpg", ".jpeg", ".tiff"]:
-            poller = get_doc_client().begin_analyze_document("prebuilt-read", body=blob_data)
-            result = poller.result()
-            text = "\n".join([line.content for page in result.pages for line in page.lines])
-        else:
-            print(f"[SKIP] Unsupported file type: {blob_name}")
-            continue
+            text = re.sub(r"\s+", " ", text).strip()
+            if not text:
+                print(f"[SKIP] No text extracted from {blob_name}")
+                summary.append({"file": blob_name, "status": "no_text"})
+                continue
 
-        text = re.sub(r"\s+", " ", text).strip()
-        if not text:
-            print(f"[SKIP] No text extracted from {blob_name}")
-            continue
+            words = text.split()
+            for i in range(0, len(words), chunk_size):
+                chunk = " ".join(words[i:i + chunk_size])
+                chunk_id = make_safe_id(blob_name, i)
+                vector = embed_query(chunk)
 
-        words = text.split()
-        for i in range(0, len(words), chunk_size):
-            chunk = " ".join(words[i:i + chunk_size])
-            chunk_id = make_safe_id(blob_name, i)
-            vector = embed_query(chunk)
+                get_search_client().merge_or_upload_documents(documents=[{
+                    "title": blob_name,
+                    "chunk_id": chunk_id,
+                    "chunk": chunk,
+                    "text_vector": vector
+                }])
+                print(f"[INDEXED] {chunk_id} from {blob_name}")
+            summary.append({"file": blob_name, "status": "indexed"})
+        except Exception as e:
+            print(f"[ERROR] Failed to index {blob_name}: {e}")
+            summary.append({"file": blob_name, "status": "error", "error": str(e)})
 
-            get_search_client().merge_or_upload_documents(documents=[{
-                "title": blob_name,
-                "chunk_id": chunk_id,
-                "chunk": chunk,
-                "text_vector": vector
-            }])
-            print(f"[INDEXED] {chunk_id} from {blob_name}")
+    return summary
 
 def retrieve_similar_docs(query: str, top_k: int = TOP_K):
     query_vector = embed_query(query)

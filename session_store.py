@@ -1,7 +1,7 @@
 import os
 import uuid
 import bcrypt
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from azure.cosmos import CosmosClient, exceptions
 from azure.keyvault.secrets import SecretClient
@@ -151,7 +151,7 @@ def create_user(username: str, password: str, role: str):
         "username": username,
         "password": hashed_password,
         "role": role,
-        "created_at": datetime.utcnow().isoformat()
+        "created_at": datetime.now(timezone.utc).isoformat()  # Fixed
     }
     
     try:
@@ -225,7 +225,7 @@ def create_session(system_prompt=None, user_id=None):
         "history": [{"role": "system", "content": system_prompt}],
         "system_prompt": system_prompt,
         "summary": "",
-        "created_at": datetime.utcnow().isoformat()
+        "created_at": datetime.now(timezone.utc).isoformat()  # Fixed
     }
     
     # Associate with user if provided
