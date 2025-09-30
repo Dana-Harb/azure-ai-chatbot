@@ -108,10 +108,23 @@ def get_function_definitions():
 def clear_conversation_fn(session_id, reason=None):
     """Clear conversation function implementation using actual session clearing"""
     clear_session(session_id)
+    
+    # Get the fresh session after clearing
+    from session_store import get_session
+    fresh_session = get_session(session_id)
+    
     return {
         "success": True,
         "message": f"Conversation cleared. Reason: {reason if reason else 'User requested to start fresh'}",
-        "session_id": session_id
+        "session_id": session_id,
+        "refresh_required": True,  # Signal to client that refresh is needed
+        "cleared_session": {
+            "history": fresh_session.get("history", []),
+            "summary": fresh_session.get("summary", ""),
+            "system_prompt": fresh_session.get("system_prompt", ""),
+            "message_count": len([msg for msg in fresh_session.get("history", []) 
+                                if msg["role"] in ["user", "assistant"]])
+        }
     }
 
 def find_coffee_shops_fn(city, limit=5, coffee_type="any"):
