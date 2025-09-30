@@ -8,12 +8,15 @@ from session_store import (
     create_user, get_user_sessions, get_user_by_id,
     get_container, get_users_container
 )
+
 import logging, os, json
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from datetime import datetime, timezone
 import uuid
 
-from rag_pipeline import generate_response_with_context, index_all_blobs_stream
+from tools import get_function_definitions, execute_function
+
+from rag_pipeline import generate_response_with_context, index_all_blobs_stream, get_openai_client, AZURE_OPENAI_DEPLOYMENT
 from speech_interface import listen, synthesize_text_to_audio
 
 from azure.identity import DefaultAzureCredential
@@ -23,8 +26,7 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 from datetime import datetime
 
-# Comment out startup indexing to avoid Key Vault issues during import
-# Indexing will happen on first request or via admin endpoint
+
 logging.info("Function app started - lazy loading enabled")
 
 @app.route(route="login", methods=["POST", "OPTIONS"])
@@ -139,7 +141,6 @@ def get_session_history(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="chat", methods=["POST", "OPTIONS"])
 def chat(req: func.HttpRequest) -> func.HttpResponse:
-    # Handle CORS preflight
     if req.method == "OPTIONS":
         return func.HttpResponse(
             status_code=204,
@@ -152,89 +153,138 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
 
     session_id = None
     user_id = None
-    
     try:
         req_body = req.get_json()
         input_type = req_body.get("input_type", "text")
         message = req_body.get("message", "").strip()
         audio_base64 = req_body.get("audio_base64")
         session_id = req_body.get("session_id")
-        user_id = req_body.get("user_id")  # Get user_id from frontend
+        user_id = req_body.get("user_id")
 
-        # Verify session ownership if both session_id and user_id are provided
+        # Verify session ownership
         if session_id and user_id:
             session = get_session(session_id)
             if session and session.get("user_id") and session["user_id"] != user_id:
                 return func.HttpResponse(
-                    json.dumps({
-                        "error": "Session does not belong to this user",
-                        "session_id": session_id
-                    }),
+                    json.dumps({"error": "Session does not belong to this user", "session_id": session_id}),
                     status_code=403,
                     mimetype="application/json",
                     headers={"Access-Control-Allow-Origin": "*"},
                 )
 
+        # Create session if not exists
         if not session_id:
-            # Create new session, associate with user if provided
             session_id = create_session(user_id=user_id)
 
         user_text = None
         recognized_text = None
-        
-        # Speech input
+
+        # --- Speech input ---
         if input_type == "speech" and audio_base64:
             try:
-                logging.info("Processing speech input...")
                 audio_bytes = base64.b64decode(audio_base64)
-                logging.info(f"Audio data size: {len(audio_bytes)} bytes")
-                
                 recognized_text = listen(audio_bytes)
                 user_text = recognized_text
-                logging.info(f"Recognized text: {recognized_text}")
-            except Exception as e:
-                logging.error(f"STT processing failed: {str(e)}")
+            except Exception:
                 user_text = "[Speech recognition failed]"
                 recognized_text = user_text
 
-        # Text input
+        # --- Text input ---
         elif input_type == "text" and message:
             user_text = message
         else:
             user_text = "[No input provided]"
             recognized_text = user_text
 
-        # Check for clear command AFTER user_text is set
-        if user_text and user_text.strip().lower() == "/clear":
+        # --- Function calling logic ---
+        ai_reply = None
+        references = []
+        audio_response_base64 = None
+
+        # Get session history for context
+        session = get_session(session_id)
+        history = session.get("history", [])
+        
+        # Prepare messages for OpenAI with function definitions
+        messages = history.copy()
+        
+        # Add user message
+        messages.append({"role": "user", "content": user_text})
+
+        # Handle special clear command
+        if user_text.strip().lower() == "/clear":
             clear_session(session_id)
-            return func.HttpResponse(
-                json.dumps({
-                    "reply": "Chat history cleared.",
-                    "session_id": session_id
-                }),
-                status_code=200,
-                mimetype="application/json",
-                headers={"Access-Control-Allow-Origin": "*"},
-            )
+            ai_reply = "Chat history cleared."
+        else:
+            # Step 1: First API call - check if functions should be called
+            try:
+                client = get_openai_client()
+                deployment = AZURE_OPENAI_DEPLOYMENT
+                
+                first_response = client.chat.completions.create(
+                    model=deployment,
+                    messages=messages,
+                    tools=get_function_definitions(),
+                    tool_choice="auto",
+                    max_tokens=150,
+                    temperature=0.7
+                )
+                
+                response_message = first_response.choices[0].message
+                tool_calls = response_message.tool_calls
+                
+                # Step 2: If functions are called, execute them
+                if tool_calls:
+                    # Add the assistant's message with tool calls to history
+                    messages.append(response_message)
+                    
+                    # Step 3: Execute each function call
+                    for tool_call in tool_calls:
+                        function_name = tool_call.function.name
+                        function_args = json.loads(tool_call.function.arguments)
+                        
+                        # Execute the function using the centralized function with session_id
+                        function_response = execute_function(function_name, function_args, session_id)
+                        
+                        # Add function response to messages
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": json.dumps(function_response)
+                        })
+                    
+                    # Step 4: Second API call with function results
+                    second_response = client.chat.completions.create(
+                        model=deployment,
+                        messages=messages,
+                        max_tokens=150,
+                        temperature=0.7
+                    )
+                    
+                    ai_reply = second_response.choices[0].message.content
+                    
+                else:
+                    # No function calls, use direct response
+                    ai_reply = response_message.content
+                    
+            except Exception as e:
+                logging.error(f"OpenAI API error: {str(e)}")
+                # Fallback to RAG response
+                rag_response = generate_response_with_context(user_text)
+                ai_reply = rag_response.get("answer", "I couldn't generate a response.")
+                references = rag_response.get("references", [])
 
-        # Generate RAG response
-        rag_response = generate_response_with_context(user_text)
-        ai_reply = rag_response.get("answer", "I couldn't generate a response.")
-        references = rag_response.get("references", [])
-
-        # Update session history with user context
+        # --- Update session ---
         update_session(session_id, user_text, ai_reply, user_id=user_id)
 
-        # TTS - Only generate audio if we have a meaningful response
-        audio_response_base64 = None
+        # --- TTS output ---
         if ai_reply and not ai_reply.startswith("I couldn't"):
             try:
                 audio_bytes = synthesize_text_to_audio(ai_reply)
                 if audio_bytes:
                     audio_response_base64 = base64.b64encode(audio_bytes).decode("utf-8")
-                    logging.info("TTS audio generated successfully")
-            except Exception as e:
-                logging.warning(f"TTS failed: {str(e)}")
+            except Exception:
+                pass
 
         return func.HttpResponse(
             json.dumps({
@@ -250,12 +300,9 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     except Exception as e:
-        logging.error(f"Unexpected error in chat endpoint: {str(e)}")
+        logging.error(f"Chat error: {str(e)}")
         return func.HttpResponse(
-            json.dumps({
-                "error": "Internal server error",
-                "session_id": session_id
-            }),
+            json.dumps({"error": "Internal server error", "session_id": session_id}),
             status_code=500,
             mimetype="application/json",
             headers={"Access-Control-Allow-Origin": "*"},
@@ -866,6 +913,7 @@ def admin_upload_document(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     try:
+        # Authentication check
         auth_header = req.headers.get("Authorization", "")
         if not auth_header or not auth_header.startswith("Bearer "):
             return func.HttpResponse(
@@ -875,69 +923,140 @@ def admin_upload_document(req: func.HttpRequest) -> func.HttpResponse:
                 headers={"Access-Control-Allow-Origin": "*"},
             )
 
-        keyvault_name = os.getenv("KEYVAULT_NAME")
-        if not keyvault_name:
-            raise ValueError("KEYVAULT_NAME environment variable is not set")
+        debug_info = {}
+        connection_string = None
+        source = None
 
-        keyvault_url = f"https://{keyvault_name}.vault.azure.net/"
-        credential = DefaultAzureCredential()
-        secret_client = SecretClient(vault_url=keyvault_url, credential=credential)
+        # Method 1: Try Key Vault direct access
+        try:
+            keyvault_name = os.getenv("KEYVAULT_NAME")
+            if keyvault_name:
+                from azure.identity import ManagedIdentityCredential
+                credential = ManagedIdentityCredential()
+                keyvault_url = f"https://{keyvault_name}.vault.azure.net/"
+                secret_client = SecretClient(vault_url=keyvault_url, credential=credential)
+                
+                secret = secret_client.get_secret("BLOB-CONNECTION-STRING")
+                test_cs = secret.value
+                
+                # Test this connection string
+                test_client = BlobServiceClient.from_connection_string(test_cs)
+                list(test_client.list_containers())  # Test connection
+                
+                connection_string = test_cs
+                source = "keyvault_direct"
+                debug_info["keyvault_direct"] = "SUCCESS"
+                
+        except Exception as e:
+            debug_info["keyvault_direct"] = f"FAILED: {str(e)}"
 
-        secret_name = "BLOB-CONNECTION-STRING"  
-        connection_string = secret_client.get_secret(secret_name).value
+        # Method 2: Try Key Vault reference
+        if not connection_string:
+            try:
+                test_cs = os.getenv("BLOB_CONNECTION_STRING")
+                if test_cs:
+                    test_client = BlobServiceClient.from_connection_string(test_cs)
+                    list(test_client.list_containers())  # Test connection
+                    
+                    connection_string = test_cs
+                    source = "keyvault_reference"
+                    debug_info["keyvault_reference"] = "SUCCESS"
+                    
+            except Exception as e:
+                debug_info["keyvault_reference"] = f"FAILED: {str(e)}"
 
+        # Method 3: Fallback to AzureWebJobsStorage
+        if not connection_string:
+            try:
+                test_cs = os.getenv("AzureWebJobsStorage")
+                if test_cs:
+                    test_client = BlobServiceClient.from_connection_string(test_cs)
+                    list(test_client.list_containers())  # Test connection
+                    
+                    connection_string = test_cs
+                    source = "azure_web_jobs"
+                    debug_info["azure_web_jobs"] = "SUCCESS"
+                    
+            except Exception as e:
+                debug_info["azure_web_jobs"] = f"FAILED: {str(e)}"
+
+        # If no method worked
+        if not connection_string:
+            return func.HttpResponse(
+                json.dumps({
+                    "error": "All connection methods failed", 
+                    "debug_info": debug_info
+                }),
+                status_code=500,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+        # Now proceed with the upload using the working connection string
         blob_service_client = BlobServiceClient.from_connection_string(connection_string)
         container_client = blob_service_client.get_container_client("documents")
 
-        file_bytes = req.get_body()
-        filename = req.headers.get("X-Filename", "upload.bin")
+        # Ensure container exists
         try:
-            # Ensure filename is UTF-8
-            filename = filename.encode("utf-8").decode("utf-8")
-        except Exception as e:
-            logging.warning(f"Filename encoding issue: {e}")
-            filename = "upload.bin"
+            container_client.get_container_properties()
+        except Exception:
+            container_client.create_container()
 
-        ext = os.path.splitext(filename)[1].lower()
-
-        allowed_extensions = [".pdf", ".txt", ".doc", ".docx", ".png", ".jpg", ".jpeg", ".tiff"]
-        if ext not in allowed_extensions:
+        # Process file upload
+        file_bytes = req.get_body()
+        if not file_bytes:
             return func.HttpResponse(
-                json.dumps({"error": f"Invalid file type. Allowed: {', '.join(allowed_extensions)}"}),
+                json.dumps({"error": "No file data"}),
                 status_code=400,
                 mimetype="application/json",
                 headers={"Access-Control-Allow-Origin": "*"},
             )
 
-        # Log file info for diagnostics
-        logging.info(f"Uploading file: {filename} ({len(file_bytes)} bytes)")
+        filename = req.headers.get("X-Filename", "upload.bin")
+        filename = os.path.basename(filename)
 
-        from datetime import timezone
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        unique_id = str(uuid.uuid4())[:8]
-        blob_name = f"{timestamp}_{unique_id}{ext}"
+        # Validate extension
+        ext = os.path.splitext(filename)[1].lower()
+        allowed_extensions = [".pdf", ".txt", ".doc", ".docx", ".png", ".jpg", ".jpeg", ".tiff"]
+        if ext not in allowed_extensions:
+            return func.HttpResponse(
+                json.dumps({"error": f"Invalid file type: {ext}"}),
+                status_code=400,
+                mimetype="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
 
+        # Generate blob name and upload
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        blob_name = f"{timestamp}-{str(uuid.uuid4())[:8]}{ext}"
+        
         content_type_map = {
             ".pdf": "application/pdf",
             ".txt": "text/plain",
             ".doc": "application/msword",
             ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             ".png": "image/png",
-            ".jpg": "image/jpeg",
+            ".jpg": "image/jpeg", 
             ".jpeg": "image/jpeg",
             ".tiff": "image/tiff",
         }
-        detected_content_type = content_type_map.get(ext, "application/octet-stream")
+        content_type = content_type_map.get(ext, "application/octet-stream")
 
         blob_client = container_client.get_blob_client(blob_name)
         blob_client.upload_blob(
             file_bytes,
             overwrite=True,
-            content_settings=ContentSettings(content_type=detected_content_type),
+            content_settings=ContentSettings(content_type=content_type),
         )
 
         return func.HttpResponse(
-            json.dumps({"message": "File uploaded", "blob_name": blob_name, "url": blob_client.url}),
+            json.dumps({
+                "message": "File uploaded successfully",
+                "blob_name": blob_name,
+                "filename": filename,
+                "source": source,
+                "debug_info": debug_info
+            }),
             status_code=200,
             mimetype="application/json",
             headers={"Access-Control-Allow-Origin": "*"},
@@ -945,15 +1064,16 @@ def admin_upload_document(req: func.HttpRequest) -> func.HttpResponse:
 
     except Exception as e:
         import traceback
-        logging.error(f"Upload error: {e}")
-        logging.error(traceback.format_exc())
         return func.HttpResponse(
-            json.dumps({"error": "Internal error", "details": str(e)}),
+            json.dumps({
+                "error": "Upload failed", 
+                "details": str(e),
+                "traceback": traceback.format_exc()
+            }),
             status_code=500,
             mimetype="application/json",
             headers={"Access-Control-Allow-Origin": "*"},
         )
-
 
 @app.route(route="management/reindex", methods=["POST", "OPTIONS"])
 def admin_reindex(req: func.HttpRequest) -> func.HttpResponse:
@@ -1015,6 +1135,8 @@ def admin_reindex(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="management/session/{session_id}", methods=["GET", "OPTIONS"])
 def admin_get_session_details(req: func.HttpRequest) -> func.HttpResponse:
+
+
     if req.method == "OPTIONS":
         return func.HttpResponse(
             status_code=204,
