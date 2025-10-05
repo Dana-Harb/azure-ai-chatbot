@@ -28,7 +28,7 @@ def get_function_definitions():
             "type": "function",
             "function": {
                 "name": "find_coffee_shops",
-                "description": "Find up to 3 coffee shops within 2km of a specific city using the TomTom Search API",
+                "description": "Find up to 3 coffee shops near a specific city using Foursquare and OpenStreetMap APIs",  # 🔥 UPDATED
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -152,8 +152,8 @@ def try_foursquare_search(city, coffee_type):
         
         params = {
             "query": "coffee",
-            "near": f"{city}, Italy",
-            "limit": 5,  # Get more to filter better
+            "near": city,  # Just the city name
+            "limit": 5,
             "categories": category_id,
             "sort": "DISTANCE"
         }
@@ -175,7 +175,7 @@ def try_foursquare_search(city, coffee_type):
         logging.info(f"✅ Foursquare found {len(data.get('results', []))} total results")
         
         places = []
-        for venue in data.get("results", [])[:3]:  # Return top 3
+        for venue in data.get("results", [])[:3]:
             location = venue.get("location", {})
             
             # Build address
@@ -186,6 +186,8 @@ def try_foursquare_search(city, coffee_type):
                 address_parts.append(location.get("locality"))
             if location.get("region"):
                 address_parts.append(location.get("region"))
+            if location.get("country"):
+                address_parts.append(location.get("country"))  # Add country if available
                 
             address = ", ".join(address_parts) if address_parts else "Address not available"
             
@@ -226,7 +228,7 @@ def try_osm_search(city, coffee_type):
         # Geocoding with Nominatim
         geo_url = "https://nominatim.openstreetmap.org/search"
         geo_params = {
-            "q": f"{city}, Italy",
+            "q": city,  # Just the city name
             "format": "json",
             "limit": 1
         }
@@ -243,6 +245,10 @@ def try_osm_search(city, coffee_type):
             
         lat = geo_data[0]["lat"]
         lon = geo_data[0]["lon"]
+        
+        # Log the actual location found for debugging
+        found_location = geo_data[0].get("display_name", "Unknown location")
+        logging.info(f"🌍 OSM geocoded '{city}' to: {found_location}")
         
         # Use Overpass API to find cafes
         overpass_query = f"""
@@ -272,6 +278,10 @@ def try_osm_search(city, coffee_type):
                 address_parts.append(tags.get("addr:street"))
             if tags.get("addr:housenumber"):
                 address_parts.append(tags.get("addr:housenumber"))
+            if tags.get("addr:city"):
+                address_parts.append(tags.get("addr:city"))
+            if tags.get("addr:country"):
+                address_parts.append(tags.get("addr:country"))
                 
             address = ", ".join(address_parts) if address_parts else "Address not available"
             
@@ -286,7 +296,8 @@ def try_osm_search(city, coffee_type):
             "city": city, 
             "places_found": len(places), 
             "places": places, 
-            "source": "openstreetmap"
+            "source": "openstreetmap",
+            "actual_location": found_location  # For debugging
         }
         
     except Exception as e:
