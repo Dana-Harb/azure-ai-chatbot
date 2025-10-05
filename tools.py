@@ -225,10 +225,10 @@ def try_osm_search(city, coffee_type):
     try:
         logging.info(f"🔄 Falling back to OpenStreetMap for {city}")
         
-        # Geocoding with Nominatim
+        
         geo_url = "https://nominatim.openstreetmap.org/search"
         geo_params = {
-            "q": city,  # Just the city name
+            "q": city,  
             "format": "json",
             "limit": 1
         }
@@ -297,7 +297,7 @@ def try_osm_search(city, coffee_type):
             "places_found": len(places), 
             "places": places, 
             "source": "openstreetmap",
-            "actual_location": found_location  # For debugging
+            "actual_location": found_location 
         }
         
     except Exception as e:
