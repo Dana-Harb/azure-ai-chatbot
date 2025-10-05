@@ -1,4 +1,5 @@
 import azure.functions as func
+import requests
 import json
 import logging
 import base64
@@ -225,13 +226,16 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
                     model=deployment,
                     messages=messages,
                     tools=get_function_definitions(),
-                    tool_choice="auto",
-                    max_tokens=150,
-                    temperature=0.7
+                    max_tokens=400,
+                    temperature=0.7,
                 )
-                
+
+                logging.info(f"[DEBUG] Tools passed to model: {get_function_definitions()}")
+
                 response_message = first_response.choices[0].message
                 tool_calls = response_message.tool_calls
+
+                logging.info(f"[DEBUG] Tool calls detected: {tool_calls}")
                 
                 # Step 2: If functions are called, execute them
                 if tool_calls:
@@ -1190,6 +1194,46 @@ def admin_get_session_details(req: func.HttpRequest) -> func.HttpResponse:
         logging.error(f"Admin session details error: {str(e)}")
         return func.HttpResponse(
             json.dumps({"error": "Internal server error"}),
+            status_code=500,
+            mimetype="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+
+@app.route(route="debug_api", methods=["GET"])
+def debug_api(req: func.HttpRequest) -> func.HttpResponse:
+    """Debug endpoint to check API key and test TomTom API"""
+    try:
+        api_key = os.getenv("PLACE_SEARCH_API_KEY")
+        has_key = bool(api_key)
+        key_prefix = api_key[:8] + "..." if api_key and len(api_key) > 8 else "None"
+        
+        # Test a simple geocode request
+        test_result = {}
+        if api_key:
+            try:
+                geo_url = "https://api.tomtom.com/search/2/geocode/.json"
+                geo_response = requests.get(geo_url, params={"query": "Milano, Italy", "key": api_key}, timeout=10)
+                test_result = {
+                    "status": geo_response.status_code,
+                    "data": geo_response.json() if geo_response.status_code == 200 else geo_response.text
+                }
+            except Exception as e:
+                test_result = {"error": str(e)}
+        
+        return func.HttpResponse(
+            json.dumps({
+                "api_key_configured": has_key,
+                "api_key_prefix": key_prefix,
+                "test_result": test_result
+            }),
+            status_code=200,
+            mimetype="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
             status_code=500,
             mimetype="application/json",
             headers={"Access-Control-Allow-Origin": "*"},
