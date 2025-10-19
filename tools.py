@@ -28,7 +28,7 @@ def get_function_definitions():
             "type": "function",
             "function": {
                 "name": "find_coffee_shops",
-                "description": "Find up to 3 coffee shops near a specific city using Foursquare and OpenStreetMap APIs",  # 🔥 UPDATED
+                "description": "Find up to 3 coffee shops near a specific city using Foursquare and OpenStreetMap APIs",  
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -135,11 +135,11 @@ def try_foursquare_search(city, coffee_type):
 
         # Map coffee types to Foursquare categories
         category_map = {
-            "specialty": "13032",  # Coffee Shop
-            "cafe": "13032",       # Coffee Shop  
-            "espresso_bar": "13032", # Coffee Shop
-            "roastery": "13032",   # Coffee Shop
-            "any": "13032"         # Coffee Shop
+            "specialty": "13032",  
+            "cafe": "13032",         
+            "espresso_bar": "13032", 
+            "roastery": "13032",   
+            "any": "13032"         
         }
         
         category_id = category_map.get(coffee_type, "13032")
@@ -152,7 +152,7 @@ def try_foursquare_search(city, coffee_type):
         
         params = {
             "query": "coffee",
-            "near": city,  # Just the city name
+            "near": city,  
             "limit": 5,
             "categories": category_id,
             "sort": "DISTANCE"
@@ -168,11 +168,11 @@ def try_foursquare_search(city, coffee_type):
         logging.info(f"📨 Foursquare response status: {response.status_code}")
         
         if response.status_code != 200:
-            logging.error(f"❌ Foursquare API failed: {response.status_code} - {response.text}")
+            logging.error(f" Foursquare API failed: {response.status_code} - {response.text}")
             return None
             
         data = response.json()
-        logging.info(f"✅ Foursquare found {len(data.get('results', []))} total results")
+        logging.info(f" Foursquare found {len(data.get('results', []))} total results")
         
         places = []
         for venue in data.get("results", [])[:3]:
@@ -187,7 +187,7 @@ def try_foursquare_search(city, coffee_type):
             if location.get("region"):
                 address_parts.append(location.get("region"))
             if location.get("country"):
-                address_parts.append(location.get("country"))  # Add country if available
+                address_parts.append(location.get("country")) 
                 
             address = ", ".join(address_parts) if address_parts else "Address not available"
             
@@ -198,14 +198,14 @@ def try_foursquare_search(city, coffee_type):
                 "categories": [cat.get('name', '') for cat in venue.get('categories', [])]
             }
             
-            # Add rating if available
+            
             if venue.get('rating'):
                 place_data["rating"] = f"{venue.get('rating')}/10"
                 
             places.append(place_data)
-            logging.info(f"📍 Foursquare found: {venue.get('name')} - {address}")
+            logging.info(f" Foursquare found: {venue.get('name')} - {address}")
 
-        logging.info(f"🎯 Foursquare returning {len(places)} places")
+        logging.info(f" Foursquare returning {len(places)} places")
         return {
             "city": city, 
             "coffee_type": coffee_type,
@@ -215,7 +215,7 @@ def try_foursquare_search(city, coffee_type):
         }
         
     except Exception as e:
-        logging.error(f"💥 Foursquare search failed: {str(e)}")
+        logging.error(f" Foursquare search failed: {str(e)}")
         import traceback
         logging.error(traceback.format_exc())
         return None
@@ -223,7 +223,7 @@ def try_foursquare_search(city, coffee_type):
 def try_osm_search(city, coffee_type):
     """Fallback to OpenStreetMap"""
     try:
-        logging.info(f"🔄 Falling back to OpenStreetMap for {city}")
+        logging.info(f" Falling back to OpenStreetMap for {city}")
         
         
         geo_url = "https://nominatim.openstreetmap.org/search"
@@ -246,11 +246,11 @@ def try_osm_search(city, coffee_type):
         lat = geo_data[0]["lat"]
         lon = geo_data[0]["lon"]
         
-        # Log the actual location found for debugging
-        found_location = geo_data[0].get("display_name", "Unknown location")
-        logging.info(f"🌍 OSM geocoded '{city}' to: {found_location}")
         
-        # Use Overpass API to find cafes
+        found_location = geo_data[0].get("display_name", "Unknown location")
+        logging.info(f"OSM geocoded '{city}' to: {found_location}")
+        
+        
         overpass_query = f"""
         [out:json][timeout:25];
         (

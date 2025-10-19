@@ -1,3 +1,4 @@
+'''
 azure-functions
 python-dotenv
 pdfplumber
@@ -15,6 +16,52 @@ bcrypt>=4.0.0
 azure-identity
 azure-keyvault-secrets
 requests
+websockets
+fastapi
+uvicorn
+pydantic
+'''
+# Azure Functions runtime
+azure-functions==2.12.0
+
+# Environment variables
+python-dotenv==1.0.0
+
+# Data processing
+pandas==2.1.0
+numpy==1.27.0
+pdfplumber==0.10.1
+
+# Azure SDKs
+azure-cosmos==4.3.0
+azure-core==1.30.0
+azure-identity==1.16.0
+azure-keyvault-secrets==5.14.0
+azure-storage-blob==12.28.0
+azure-ai-documentintelligence==1.1.0
+azure-cognitiveservices-speech==1.25.0
+azure-search-documents==11.7.0
+
+# OpenAI SDK
+openai==1.31.0
+tiktoken==0.4.0
+
+# Security
+bcrypt==4.0.1
+
+# FastAPI & Websockets
+fastapi==0.102.0
+uvicorn==0.23.0
+websockets==15.0.1
+pydantic==2.6.1
+
+# Optional / async file handling
+aiofiles==23.2.1
+python-multipart==0.0.6
+
+# Type hints (if needed for modern FastAPI/Pydantic)
+typing-extensions==4.7.1
+
 
 
 
