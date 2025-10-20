@@ -42,12 +42,11 @@ async def health_check():
 
 # ---------- Helpers ----------
 def build_session_update():
-    # Azure expects string values for audio formats
     return {
         "type": "session.update",
         "session": {
             "modalities": ["text", "audio"],
-            "instructions": "You are a helpful assistant that speaks clearly and naturally.",
+            "instructions": "You are an expert barista with deep knowledge of coffee, brewing methods, beans, and recipes. Keep responses concise and helpful—limit to 2–3 sentences.",
             "voice": "alloy",
             "input_audio_format": "pcm16",
             "output_audio_format": "pcm16",
@@ -90,12 +89,11 @@ async def livechat_socket(websocket: WebSocket):
     # Track current response and drop state for precise cancel + stop streaming
     state = {
         "model_speaking": False,
-        "drop_audio": False,            # when True, don't forward audio to client
-        "current_response_id": None,    # ID of the in-flight response (for cancel)
+        "drop_audio": False,            
+        "current_response_id": None,    
     }
 
     try:
-        # Connect upstream + session setup
         try:
             gpt_ws = await connect_to_gpt_realtime(GPT_REALTIME_URI)
             await gpt_ws.send(json.dumps(build_session_update()))
