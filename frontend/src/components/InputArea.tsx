@@ -353,7 +353,7 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
   };
 
   const stopLiveTalk = () => {
-    // Ask backend to commit any pending buffer (optional)
+    // Ask backend to commit any pending buffer 
     try {
       if (liveSocketRef.current?.readyState === WebSocket.OPEN) {
         liveSocketRef.current.send(JSON.stringify({ type: 'commit' }));

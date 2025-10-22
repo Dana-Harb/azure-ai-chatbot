@@ -179,14 +179,14 @@ async def livechat_socket(websocket: WebSocket):
                 while not cancel.is_set():
                     raw = await gpt_ws.recv()
 
-                    # Binary (rare) -> forward as base64 if not dropping
+                    
                     if isinstance(raw, (bytes, bytearray)):
                         if ws_is_connected(websocket) and not state["drop_audio"]:
                             b64 = base64.b64encode(raw).decode("utf-8")
                             await websocket.send_text(json.dumps({"audioChunk": b64}))
                         continue
 
-                    # JSON events
+                    
                     try:
                         data = json.loads(raw)
                     except json.JSONDecodeError:
@@ -196,13 +196,13 @@ async def livechat_socket(websocket: WebSocket):
 
                     etype = data.get("type")
 
-                    # Track response id for precise cancel
+                    
                     if etype in ("response.created", "response.started"):
                         rid = data.get("id") or (data.get("response") or {}).get("id")
                         if rid:
                             state["current_response_id"] = rid
 
-                    # Audio streaming: start/end + deltas
+                    
                     if etype in ("response.output_audio.delta", "response.audio.delta"):
                         if not state["model_speaking"]:
                             state["model_speaking"] = True
@@ -236,17 +236,17 @@ async def livechat_socket(websocket: WebSocket):
                             user_tr = final_txt
                             await websocket.send_text(json.dumps({"transcript": user_tr, "who": "user"}))
 
-                    # Response canceled or errored
+                    
                     elif etype in ("response.canceled", "response.error"):
                         if ws_is_connected(websocket):
-                            # Tell client to flush any queued audio and end speaking
+                            
                             await websocket.send_text(json.dumps({"event": "flush_audio"}))
                             await websocket.send_text(json.dumps({"event": "model_speech_end"}))
                         state["model_speaking"] = False
                         state["drop_audio"] = True
                         state["current_response_id"] = None
 
-                    # Response completed
+                    
                     elif etype in ("response.completed", "response.output_audio.done"):
                         if ws_is_connected(websocket):
                             await websocket.send_text(json.dumps({"event": "model_speech_end"}))
@@ -259,7 +259,7 @@ async def livechat_socket(websocket: WebSocket):
                         except Exception:
                             pass
 
-                    # Generic passthrough
+                    
                     else:
                         audio_b64 = data.get("audio")
                         transcript = data.get("transcript") or data.get("text")
