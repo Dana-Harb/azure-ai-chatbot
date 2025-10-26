@@ -114,7 +114,6 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
       else if (data.error)
         addMessage('bot', `Error: ${data.error}`);
     } catch (err) {
-      
       console.error('Error sending message:', err);
       addMessage('bot', 'Error: Could not reach server.');
     }
@@ -184,6 +183,32 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
   const handleLiveSocketMessage = (event: MessageEvent) => {
     try {
       const data = JSON.parse(event.data);
+
+      // NEW: Optional display of tool/function results
+      if (data.event === 'tool_result') {
+        try {
+          if (data.function === 'find_coffee_shops') {
+            const places = (data.result?.places ?? []) as Array<{name:string; address:string}>;
+            const city = data.result?.city || '';
+            const header = city ? `Top coffee spots in ${city}:` : `Top coffee spots:`;
+            const lines = places.length
+              ? places.map(p => `• ${p.name}${p.address && p.address !== 'Address not available' ? ` — ${p.address}` : ''}`).join('\n')
+              : '• No places found.';
+            const summary = `${header}\n${lines}`;
+            setBotTranscript(prev => (prev ? `${prev}\n${summary}` : summary));
+          } else if (data.function === 'calculate_brew_ratio') {
+            const advice = data.result?.advice || 'Brew ratio calculated.';
+            setBotTranscript(prev => (prev ? `${prev}\n${advice}` : advice));
+          } else {
+            // fallback for unknown tools
+            const summary = `[${data.function}] completed.`;
+            setBotTranscript(prev => (prev ? `${prev}\n${summary}` : summary));
+          }
+        } catch {
+          // silent UI fallback
+        }
+        return;
+}
 
       // Server can tell us to flush immediately
       if (data.event === 'flush_audio') {
@@ -319,7 +344,6 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
       const socket = new WebSocket('ws://127.0.0.1:8000/ws/livechat');
       socket.binaryType = 'arraybuffer';
       socket.onerror = (err) => {
-
         console.error('WebSocket error:', err);
       };
       socket.onmessage = handleLiveSocketMessage;
