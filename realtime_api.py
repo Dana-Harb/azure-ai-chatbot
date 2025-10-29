@@ -64,16 +64,13 @@ def build_session_update():
     return {
         "type": "session.update",
         "session": {
-            "modalities": ["text", "audio"],
-            "instructions": (   "You are an expert barista with deep knowledge of coffee, brewing methods, beans, and recipes. "
-                                "Your goal is to provide concise, helpful answers: "
-                                "- Keep responses brief and to the point (2-3 sentences maximum)"
-                                "- Supplement with your own knowledge if it adds value. "
-                                "- Cite sources used, either from the documents or external knowledge. "
-                                "- Provide a link to reliable resources if available. "
-                                "- Answer in the same language as the query (Arabic or English). "
-                                "- Do not fabricate references."
-                                "- Be concise and avoid unnecessary details."),
+            "modalities": ["text", "audio"],  # ensure both
+            "instructions": (
+                "You are a coffee-only expert assistant. "
+                "Stay within coffee: beans, processing, roasting, grinding, extraction theory, brewing methods/recipes, "
+                "espresso, water chemistry, equipment setup/maintenance, tasting. "
+                "Decline non-coffee topics briefly."
+            ),
             "voice": "alloy",
             "input_audio_format": "pcm16",
             "output_audio_format": "pcm16",
@@ -170,7 +167,11 @@ async def livechat_socket(websocket: WebSocket):
 
                                 if ptype == "commit":
                                     await gpt_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                                    await gpt_ws.send(json.dumps({"type": "response.create"}))
+                                    # Force both modalities for each reply
+                                    await gpt_ws.send(json.dumps({
+                                        "type": "response.create",
+                                        "response": { "modalities": ["text", "audio"] }
+                                    }))
 
                                 elif ptype == "input_text":
                                     await gpt_ws.send(json.dumps(payload))
@@ -234,6 +235,14 @@ async def livechat_socket(websocket: WebSocket):
                         rid = data.get("id") or (data.get("response") or {}).get("id")
                         if rid:
                             state["current_response_id"] = rid
+                        # SEND A CLEAR BOUNDARY TO FRONTEND AND RESET LOCAL BUFFER
+                        bot_tr = ""
+                        user_tr = ""
+                        if ws_is_connected(websocket):
+                            await websocket.send_text(json.dumps({
+                                "event": "new_response",
+                                "response_id": rid
+                            }))
 
                     # Bot audio deltas (output)
                     if etype in ("response.output_audio.delta", "response.audio.delta"):
@@ -248,11 +257,28 @@ async def livechat_socket(websocket: WebSocket):
                             if delta_b64 and ws_is_connected(websocket):
                                 await websocket.send_text(json.dumps({"audioChunk": delta_b64}))
 
-                    # Bot text deltas (optional)
-                    elif etype in ("response.output_text.delta", "response.text.delta"):
-                        delta_txt = data.get("delta", "")
+                    # Bot text deltas (handle multiple possible event names)
+                    elif etype in ("response.output_text.delta", "response.text.delta", "response.content_part.added", "response.content_part.delta", "response.refusal.delta"):
+                        # Try to extract text from typical fields
+                        delta_txt = ""
+                        if "delta" in data and isinstance(data["delta"], str):
+                            delta_txt = data["delta"]
+                        elif "delta" in data and isinstance(data["delta"], dict) and "text" in data["delta"]:
+                            delta_txt = data["delta"]["text"]
+                        elif "text" in data and isinstance(data["text"], str):
+                            delta_txt = data["text"]
+
                         if delta_txt:
                             bot_tr += delta_txt
+                            if ws_is_connected(websocket):
+                                await websocket.send_text(json.dumps({"transcript": bot_tr, "who": "bot"}))
+
+                    # Final text done events (optional)
+                    elif etype in ("response.output_text.done", "response.text.done"):
+                        # Some providers send a final text chunk here
+                        final_delta = data.get("text") or data.get("delta") or ""
+                        if isinstance(final_delta, str) and final_delta:
+                            bot_tr += final_delta
                             if ws_is_connected(websocket):
                                 await websocket.send_text(json.dumps({"transcript": bot_tr, "who": "bot"}))
 
@@ -334,6 +360,26 @@ async def livechat_socket(websocket: WebSocket):
 
                     # Model finished speaking
                     elif etype in ("response.completed", "response.output_audio.done"):
+                        # Fallback: if we never saw any text deltas, try to extract final text from response payload
+                        try:
+                            if not bot_tr:
+                                resp = data.get("response") or {}
+                                final_txt = None
+                                # Common shapes: {"output_text":"..."}, or {"content":[{"type":"output_text","text":"..."}]}
+                                if isinstance(resp.get("output_text"), str) and resp.get("output_text").strip():
+                                    final_txt = resp.get("output_text").strip()
+                                elif isinstance(resp.get("content"), list):
+                                    for part in resp.get("content", []):
+                                        if isinstance(part, dict):
+                                            txt = part.get("text") or part.get("output_text")
+                                            if isinstance(txt, str) and txt.strip():
+                                                final_txt = (final_txt + " " + txt.strip()) if final_txt else txt.strip()
+                                if final_txt and ws_is_connected(websocket):
+                                    bot_tr = final_txt
+                                    await websocket.send_text(json.dumps({"transcript": bot_tr, "who": "bot"}))
+                        except Exception as e:
+                            logger.debug(f"final text extraction failed: {e}")
+
                         if ws_is_connected(websocket):
                             await websocket.send_text(json.dumps({"event": "model_speech_end"}))
                         state["model_speaking"] = False
@@ -384,9 +430,11 @@ async def livechat_socket(websocket: WebSocket):
                                 "output": result,
                             }))
 
-                            # IMPORTANT: ask the model to continue and speak the answer
-                            # If your provider already resumes automatically, this is harmless.
-                            await gpt_ws.send(json.dumps({"type": "response.create"}))
+                            # IMPORTANT: ask the model to continue and speak the answer; force both modalities
+                            await gpt_ws.send(json.dumps({
+                                "type": "response.create",
+                                "response": { "modalities": ["text", "audio"] }
+                            }))
                             # send result to frontend for optional display
                             if ws_is_connected(websocket):
                                 await websocket.send_text(json.dumps({

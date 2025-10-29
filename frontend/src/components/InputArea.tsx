@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { Box, TextField, IconButton, CircularProgress, Typography, Stack } from '@mui/material';
 import SendIcon from '@mui/icons-material/Send';
 import MicIcon from '@mui/icons-material/Mic';
@@ -58,6 +58,7 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
   // Live talk UI state
   const [liveMode, setLiveMode] = useState(false);
   const [userTranscript, setUserTranscript] = useState('');
+  // Displayed bot transcript (revealed word-by-word)
   const [botTranscript, setBotTranscript] = useState('');
 
   // Refs to avoid re-renders causing duplicate connections
@@ -69,7 +70,8 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
   // Playback/capture control
   const playheadRef = useRef<number>(0);                           // next scheduled start time
   const outGainRef = useRef<GainNode | null>(null);                // output gain (for ducking/muting)
-  const modelSpeakingRef = useRef<boolean>(false);                 // bot speaking flag
+  const modelSpeakingRef = useRef<boolean>(false);                 // bot speaking flag (audio-based)
+  const inResponseRef = useRef<boolean>(false);                    // response boundary (text or audio)
   const lastStopAtRef = useRef<number>(0);                         // debounce for voice "stop"
   const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set()); // track scheduled nodes
   const dropChunksRef = useRef<boolean>(false);                    // ignore chunks after stop until next start
@@ -179,14 +181,128 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
     dropChunksRef.current = true; // ignore any late chunks for the old reply
   };
 
+  // === Word-by-word reveal helpers (slower + placeholder if no text yet) ===
+  const WORD_INTERVAL_MS = 340;     // slower base (tune 300–380)
+  const PAUSE_PUNCT_MS = 280;       // pause after . ! ?
+  const PAUSE_COMMA_MS = 160;       // pause after , ; :
+
+  const botTargetRef = useRef<string>('');        // latest full transcript string from server
+  const revealedWordsRef = useRef<string[]>([]);  // words already revealed
+  const pendingWordsRef = useRef<string[]>([]);   // words queued to reveal
+  const revealTimerRef = useRef<number | null>(null);
+  const placeholderTimerRef = useRef<number | null>(null);
+  const hasReceivedBotWordsRef = useRef<boolean>(false);
+
+  const clearTimer = (ref: React.MutableRefObject<number | null>) => {
+    if (ref.current !== null) {
+      window.clearTimeout(ref.current);
+      ref.current = null;
+    }
+  };
+
+  const resetBotReveal = () => {
+    botTargetRef.current = '';
+    revealedWordsRef.current = [];
+    pendingWordsRef.current = [];
+    hasReceivedBotWordsRef.current = false;
+    clearTimer(revealTimerRef);
+    clearTimer(placeholderTimerRef);
+    setBotTranscript('');
+  };
+
+  const scheduleNextReveal = (delay: number = WORD_INTERVAL_MS) => {
+    clearTimer(revealTimerRef);
+    revealTimerRef.current = window.setTimeout(tickReveal, delay);
+  };
+
+  const tickReveal = () => {
+    if (pendingWordsRef.current.length === 0) {
+      revealTimerRef.current = null;
+      return;
+    }
+    const next = pendingWordsRef.current.shift()!;
+    revealedWordsRef.current.push(next);
+    setBotTranscript(revealedWordsRef.current.join(' '));
+
+    let delay = WORD_INTERVAL_MS;
+    if (/[.?!]$/.test(next)) delay += PAUSE_PUNCT_MS;
+    else if (/[,;:]$/.test(next)) delay += PAUSE_COMMA_MS;
+
+    scheduleNextReveal(delay);
+  };
+
+  // Compute and queue only the new words to reveal based on the latest full transcript
+  const enqueueBotTranscript = (full: string) => {
+    botTargetRef.current = full || '';
+    const trimmed = botTargetRef.current.trim();
+    const targetWords = trimmed.length ? trimmed.split(/\s+/) : [];
+    const revealedCount = revealedWordsRef.current.length;
+
+    const before = pendingWordsRef.current.length;
+    for (let i = revealedCount; i < targetWords.length; i++) {
+      pendingWordsRef.current.push(targetWords[i]);
+    }
+    const added = pendingWordsRef.current.length - before;
+
+    if (added > 0) {
+      hasReceivedBotWordsRef.current = true;
+      // cancel placeholder if we just got real words
+      clearTimer(placeholderTimerRef);
+    }
+
+    if (revealTimerRef.current === null) {
+      scheduleNextReveal(WORD_INTERVAL_MS);
+    }
+  };
+
+  const finishRevealNow = () => {
+    const trimmed = botTargetRef.current.trim();
+    const targetWords = trimmed.length ? trimmed.split(/\s+/) : [];
+    revealedWordsRef.current = targetWords.slice();
+    pendingWordsRef.current = [];
+    setBotTranscript(revealedWordsRef.current.join(' '));
+    clearTimer(revealTimerRef);
+    clearTimer(placeholderTimerRef);
+  };
+
+  // Clear timers on unmount
+  useEffect(() => {
+    return () => {
+      clearTimer(revealTimerRef);
+      clearTimer(placeholderTimerRef);
+    };
+  }, []);
+
   // === REALTIME (voice barge-in + scheduled playback + transcripts) ===
   const handleLiveSocketMessage = (event: MessageEvent) => {
     try {
       const data = JSON.parse(event.data);
 
-      // NEW: Optional display of tool/function results
+      // NEW RESPONSE BOUNDARY (from backend response.created/started)
+      if (data.event === 'new_response') {
+        inResponseRef.current = true;
+        modelSpeakingRef.current = false; // new turn hasn't started audio yet
+        dropChunksRef.current = false;
+        resetBotReveal();
+
+        // Placeholder "…" if text hasn't arrived soon
+        clearTimer(placeholderTimerRef);
+        placeholderTimerRef.current = window.setTimeout(() => {
+          if (!hasReceivedBotWordsRef.current) {
+            setBotTranscript('…');
+          }
+        }, 500);
+        return;
+      }
+
+      // Tool/function result -> append into target and reveal
       if (data.event === 'tool_result') {
         try {
+          // DEFENSIVE RESET: if this is arriving for a new reply before audio start and we still show old text
+          if (!modelSpeakingRef.current && inResponseRef.current && (botTranscript || revealedWordsRef.current.length || pendingWordsRef.current.length)) {
+            resetBotReveal();
+          }
+
           if (data.function === 'find_coffee_shops') {
             const places = (data.result?.places ?? []) as Array<{name:string; address:string}>;
             const city = data.result?.city || '';
@@ -195,42 +311,60 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
               ? places.map(p => `• ${p.name}${p.address && p.address !== 'Address not available' ? ` — ${p.address}` : ''}`).join('\n')
               : '• No places found.';
             const summary = `${header}\n${lines}`;
-            setBotTranscript(prev => (prev ? `${prev}\n${summary}` : summary));
+            const newTarget = (botTargetRef.current ? `${botTargetRef.current}\n` : '') + summary;
+            enqueueBotTranscript(newTarget);
           } else if (data.function === 'calculate_brew_ratio') {
             const advice = data.result?.advice || 'Brew ratio calculated.';
-            setBotTranscript(prev => (prev ? `${prev}\n${advice}` : advice));
+            const newTarget = (botTargetRef.current ? `${botTargetRef.current}\n` : '') + advice;
+            enqueueBotTranscript(newTarget);
           } else {
-            // fallback for unknown tools
             const summary = `[${data.function}] completed.`;
-            setBotTranscript(prev => (prev ? `${prev}\n${summary}` : summary));
+            const newTarget = (botTargetRef.current ? `${botTargetRef.current}\n` : '') + summary;
+            enqueueBotTranscript(newTarget);
           }
         } catch {
           // silent UI fallback
         }
         return;
-}
+      }
 
       // Server can tell us to flush immediately
       if (data.event === 'flush_audio') {
         hardStopOutput();
+        finishRevealNow(); // finalize whatever we had
         return;
       }
 
-      // Bot speaking start/end -> duck/restore volume
+      // Bot speaking start/end -> reset transcript for new reply; show placeholder if no text arrives
       if (data.event === 'model_speech_start') {
         modelSpeakingRef.current = true;
-        dropChunksRef.current = false; // accept chunks for this speech
+        inResponseRef.current = true;
+        dropChunksRef.current = false;
+
+        // Reset (in case we didn't see new_response for some reason)
+        resetBotReveal();
+
+        // Show placeholder "…" if we don't get any bot words quickly
+        clearTimer(placeholderTimerRef);
+        placeholderTimerRef.current = window.setTimeout(() => {
+          if (!hasReceivedBotWordsRef.current) {
+            setBotTranscript('…');
+          }
+        }, 500);
+
         const ctx = audioContextRef.current;
         if (ctx && outGainRef.current) {
           outGainRef.current.gain.cancelScheduledValues(ctx.currentTime);
-          outGainRef.current.gain.setTargetAtTime(0.35, ctx.currentTime, 0.015); // duck to reduce echo
+          outGainRef.current.gain.setTargetAtTime(0.35, ctx.currentTime, 0.015);
         }
         return;
       }
       if (data.event === 'model_speech_end') {
         modelSpeakingRef.current = false;
-        // Immediately cut any queued audio and restore baseline
+        inResponseRef.current = false;
         hardStopOutput();
+        finishRevealNow();
+
         const ctx = audioContextRef.current;
         if (ctx && outGainRef.current) {
           outGainRef.current.gain.cancelScheduledValues(ctx.currentTime);
@@ -239,9 +373,24 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
         return;
       }
 
-      // Audio playback: schedule contiguously to avoid overlapping buffers
+      // Audio playback: schedule contiguous; also reset transcript if a new audio reply starts without start event
       if (data.audioChunk) {
-        if (dropChunksRef.current) return; // ignore chunks after stop until next start
+        if (!modelSpeakingRef.current && (botTranscript || revealedWordsRef.current.length || pendingWordsRef.current.length)) {
+          // New reply detected only by audio; clear old transcript
+          resetBotReveal();
+          modelSpeakingRef.current = true;
+          inResponseRef.current = true;
+
+          // Start placeholder since we detected a new reply via audio only
+          clearTimer(placeholderTimerRef);
+          placeholderTimerRef.current = window.setTimeout(() => {
+            if (!hasReceivedBotWordsRef.current) {
+              setBotTranscript('…');
+            }
+          }, 500);
+        }
+
+        if (dropChunksRef.current) return;
 
         const ctx = audioContextRef.current;
         if (!ctx) return;
@@ -255,10 +404,9 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
         const src = ctx.createBufferSource();
         src.buffer = buf;
 
-        // Ensure persistent gain for output
         if (!outGainRef.current) {
           outGainRef.current = ctx.createGain();
-          outGainRef.current.gain.value = 0.85; // baseline volume
+          outGainRef.current.gain.value = 0.85;
           outGainRef.current.connect(ctx.destination);
         }
         src.connect(outGainRef.current);
@@ -267,7 +415,6 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
         const startAt = Math.max(now + 0.02, playheadRef.current || now + 0.02);
         try { src.start(startAt); } catch { /* ignore start errors */ }
 
-        // Track and cleanup
         activeSourcesRef.current.add(src);
         src.onended = () => {
           activeSourcesRef.current.delete(src);
@@ -282,22 +429,30 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
         if (data.who === 'user') {
           setUserTranscript(data.transcript);
 
-          // Voice barge-in: if user says a stop word while bot is speaking, send 'stop'
           if (modelSpeakingRef.current && isStopPhrase(data.transcript)) {
             const nowMs = Date.now();
-            if (nowMs - lastStopAtRef.current > 600) { // debounce ~600ms
+            if (nowMs - lastStopAtRef.current > 600) {
               lastStopAtRef.current = nowMs;
-              hardStopOutput(); // cut locally right away
+              hardStopOutput();
               const s = liveSocketRef.current;
               if (s && s.readyState === WebSocket.OPEN) {
-                s.send(JSON.stringify({ type: 'stop' })); // backend cancels and sends flush_audio
+                s.send(JSON.stringify({ type: 'stop' }));
               }
             }
           }
-        } else if (data.who === 'bot') {
-          setBotTranscript(data.transcript);
         } else {
-          setBotTranscript(data.transcript); // fallback
+          // DEFENSIVE RESET: text-first reply (text delta before audio start)
+          if (!modelSpeakingRef.current && inResponseRef.current && (botTranscript || revealedWordsRef.current.length || pendingWordsRef.current.length)) {
+            resetBotReveal();
+          }
+
+          // Bot transcript stream
+          if (data.transcript.trim() === '[stopped]') {
+            botTargetRef.current = data.transcript;
+            finishRevealNow();
+          } else {
+            enqueueBotTranscript(data.transcript);
+          }
         }
       }
     } catch (err) {
@@ -316,7 +471,6 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
     }
 
     try {
-      // Strong echo suppression on capture
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -337,9 +491,11 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
       outGainRef.current.gain.value = 0.85;
       outGainRef.current.connect(ctx.destination);
       modelSpeakingRef.current = false;
+      inResponseRef.current = false;
       lastStopAtRef.current = 0;
       dropChunksRef.current = false;
       activeSourcesRef.current.clear();
+      resetBotReveal();
 
       const socket = new WebSocket('ws://127.0.0.1:8000/ws/livechat');
       socket.binaryType = 'arraybuffer';
@@ -368,7 +524,7 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
 
       // Reset transcripts at session start
       setUserTranscript('');
-      setBotTranscript('');
+      resetBotReveal();
       setLiveMode(true);
     } catch (err) {
       console.error('Failed to start live chat:', err);
@@ -377,14 +533,12 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
   };
 
   const stopLiveTalk = () => {
-    // Ask backend to commit any pending buffer 
     try {
       if (liveSocketRef.current?.readyState === WebSocket.OPEN) {
         liveSocketRef.current.send(JSON.stringify({ type: 'commit' }));
       }
     } catch (err) { void err; }
 
-    // Hard stop any remaining output nodes
     hardStopOutput();
 
     try { workletNodeRef.current?.disconnect(); } catch (err) { void err; }
@@ -410,7 +564,7 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
     liveSocketRef.current = null;
 
     setUserTranscript('');
-    setBotTranscript('');
+    resetBotReveal();
     setLiveMode(false);
   };
 
@@ -465,10 +619,10 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
           {userTranscript && (
             <Typography variant="body2"><strong>You:</strong> {userTranscript}</Typography>
           )}
-          {botTranscript && (
+          {botTranscript !== '' && (
             <Typography variant="body2"><strong>Bot:</strong> {botTranscript}</Typography>
           )}
-          {!userTranscript && !botTranscript && (
+          {userTranscript === '' && botTranscript === '' && (
             <Typography variant="body2" color="textSecondary">Live transcripts will appear here…</Typography>
           )}
         </Stack>
