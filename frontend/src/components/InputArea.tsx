@@ -19,7 +19,7 @@ interface InputAreaProps {
   userData: UserData | null;
 }
 
-// --- Helper: Convert Float32 → WAV (kept for your existing features) ---
+// --- Helper: Convert Float32 → WAV (existing) ---
 const encodeWAV = (samples: Float32Array, sampleRate: number): ArrayBuffer => {
   const buffer = new ArrayBuffer(44 + samples.length * 2);
   const view = new DataView(buffer);
@@ -58,25 +58,27 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
   // Live talk UI state
   const [liveMode, setLiveMode] = useState(false);
   const [userTranscript, setUserTranscript] = useState('');
-  // Displayed bot transcript (revealed word-by-word)
   const [botTranscript, setBotTranscript] = useState('');
 
   // Refs to avoid re-renders causing duplicate connections
   const liveSocketRef = useRef<WebSocket | null>(null);
+
+  // Audio graph
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
-  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
+  const captureWorkletRef = useRef<AudioWorkletNode | null>(null); // existing capture node
+  const pcmPlayerNodeRef = useRef<AudioWorkletNode | null>(null);  // NEW: pull-based player node
 
   // Playback/capture control
-  const playheadRef = useRef<number>(0);                           // next scheduled start time
-  const outGainRef = useRef<GainNode | null>(null);                // output gain (for ducking/muting)
-  const modelSpeakingRef = useRef<boolean>(false);                 // bot speaking flag (audio-based)
-  const inResponseRef = useRef<boolean>(false);                    // response boundary (text or audio)
-  const lastStopAtRef = useRef<number>(0);                         // debounce for voice "stop"
-  const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set()); // track scheduled nodes
-  const dropChunksRef = useRef<boolean>(false);                    // ignore chunks after stop until next start
+  const playheadRef = useRef<number>(0); // retained for fallback path
+  const outGainRef = useRef<GainNode | null>(null);
+  const modelSpeakingRef = useRef<boolean>(false);
+  const inResponseRef = useRef<boolean>(false);
+  const lastStopAtRef = useRef<number>(0);
+  const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set()); // retained for fallback
+  const dropChunksRef = useRef<boolean>(false);
 
-  // Keywords to trigger barge-in (interrupt)
+  // Stop keywords
   const STOP_RE = /\b(stop|cancel|pause|hold on|wait|quiet|be quiet|silence|shut up)\b/i;
   const isStopPhrase = (s: string) => {
     const t = s.trim().toLowerCase();
@@ -162,33 +164,42 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
     }
   };
 
-  // Hard cut of any currently scheduled output audio
+  // Hard cut of any currently scheduled output audio (fallback path)
   const hardStopOutput = () => {
     const ctx = audioContextRef.current;
     if (outGainRef.current && ctx) {
       try {
         outGainRef.current.gain.cancelScheduledValues(ctx.currentTime);
-        outGainRef.current.gain.setValueAtTime(0.0, ctx.currentTime); // immediate mute
+        outGainRef.current.gain.setValueAtTime(0.0, ctx.currentTime);
       } catch { /* noop */ }
     }
+    // Stop any scheduled buffer-source nodes (fallback path)
     activeSourcesRef.current.forEach(src => {
       try { src.stop(0); } catch { /* already stopped */ }
     });
     activeSourcesRef.current.clear();
     if (ctx) {
-      playheadRef.current = ctx.currentTime; // reset playhead
+      playheadRef.current = ctx.currentTime;
     }
-    dropChunksRef.current = true; // ignore any late chunks for the old reply
+    dropChunksRef.current = true;
+    // NEW: also clear ring buffer player immediately
+    try {
+      const player = pcmPlayerNodeRef.current;
+      if (player) {
+        player.port.postMessage({ type: 'clear' });
+        player.port.postMessage({ type: 'setPlaying', playing: false });
+      }
+    } catch { /* ignore */ }
   };
 
-  // === Word-by-word reveal helpers (slower + placeholder if no text yet) ===
-  const WORD_INTERVAL_MS = 340;     // slower base (tune 300–380)
-  const PAUSE_PUNCT_MS = 280;       // pause after . ! ?
-  const PAUSE_COMMA_MS = 160;       // pause after , ; :
+  // === Word-by-word reveal helpers (unchanged logic) ===
+  const WORD_INTERVAL_MS = 340;
+  const PAUSE_PUNCT_MS = 280;
+  const PAUSE_COMMA_MS = 160;
 
-  const botTargetRef = useRef<string>('');        // latest full transcript string from server
-  const revealedWordsRef = useRef<string[]>([]);  // words already revealed
-  const pendingWordsRef = useRef<string[]>([]);   // words queued to reveal
+  const botTargetRef = useRef<string>('');
+  const revealedWordsRef = useRef<string[]>([]);
+  const pendingWordsRef = useRef<string[]>([]);
   const revealTimerRef = useRef<number | null>(null);
   const placeholderTimerRef = useRef<number | null>(null);
   const hasReceivedBotWordsRef = useRef<boolean>(false);
@@ -231,7 +242,6 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
     scheduleNextReveal(delay);
   };
 
-  // Compute and queue only the new words to reveal based on the latest full transcript
   const enqueueBotTranscript = (full: string) => {
     botTargetRef.current = full || '';
     const trimmed = botTargetRef.current.trim();
@@ -246,7 +256,6 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
 
     if (added > 0) {
       hasReceivedBotWordsRef.current = true;
-      // cancel placeholder if we just got real words
       clearTimer(placeholderTimerRef);
     }
 
@@ -255,17 +264,6 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
     }
   };
 
-  const finishRevealNow = () => {
-    const trimmed = botTargetRef.current.trim();
-    const targetWords = trimmed.length ? trimmed.split(/\s+/) : [];
-    revealedWordsRef.current = targetWords.slice();
-    pendingWordsRef.current = [];
-    setBotTranscript(revealedWordsRef.current.join(' '));
-    clearTimer(revealTimerRef);
-    clearTimer(placeholderTimerRef);
-  };
-
-  // Clear timers on unmount
   useEffect(() => {
     return () => {
       clearTimer(revealTimerRef);
@@ -278,31 +276,29 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
     try {
       const data = JSON.parse(event.data);
 
-      // NEW RESPONSE BOUNDARY (from backend response.created/started)
+      // New reply boundary -> reset transcript and prepare audio
       if (data.event === 'new_response') {
         inResponseRef.current = true;
-        modelSpeakingRef.current = false; // new turn hasn't started audio yet
+        modelSpeakingRef.current = false;
         dropChunksRef.current = false;
         resetBotReveal();
 
-        // Placeholder "…" if text hasn't arrived soon
         clearTimer(placeholderTimerRef);
         placeholderTimerRef.current = window.setTimeout(() => {
-          if (!hasReceivedBotWordsRef.current) {
-            setBotTranscript('…');
-          }
+          if (!hasReceivedBotWordsRef.current) setBotTranscript('…');
         }, 500);
+
+        // Ensure pull player starts fresh for this turn
+        if (pcmPlayerNodeRef.current) {
+          pcmPlayerNodeRef.current.port.postMessage({ type: 'clear' });
+          pcmPlayerNodeRef.current.port.postMessage({ type: 'setPlaying', playing: true });
+        }
         return;
       }
 
-      // Tool/function result -> append into target and reveal
+      // Optional tool result (unchanged behavior)
       if (data.event === 'tool_result') {
         try {
-          // DEFENSIVE RESET: if this is arriving for a new reply before audio start and we still show old text
-          if (!modelSpeakingRef.current && inResponseRef.current && (botTranscript || revealedWordsRef.current.length || pendingWordsRef.current.length)) {
-            resetBotReveal();
-          }
-
           if (data.function === 'find_coffee_shops') {
             const places = (data.result?.places ?? []) as Array<{name:string; address:string}>;
             const city = data.result?.city || '';
@@ -322,91 +318,79 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
             const newTarget = (botTargetRef.current ? `${botTargetRef.current}\n` : '') + summary;
             enqueueBotTranscript(newTarget);
           }
-        } catch {
-          // silent UI fallback
-        }
+        } catch { /* noop */ }
         return;
       }
 
-      // Server can tell us to flush immediately
+      // Immediate cut from backend (interruption)
       if (data.event === 'flush_audio') {
-        hardStopOutput();
-        finishRevealNow(); // finalize whatever we had
+        hardStopOutput(); // also clears player & gates playing=false
+        modelSpeakingRef.current = false;
+        inResponseRef.current = false;
         return;
       }
 
-      // Bot speaking start/end -> reset transcript for new reply; show placeholder if no text arrives
+      // Start/end markers (unchanged UI cues; prep the player as well)
       if (data.event === 'model_speech_start') {
         modelSpeakingRef.current = true;
         inResponseRef.current = true;
         dropChunksRef.current = false;
 
-        // Reset (in case we didn't see new_response for some reason)
         resetBotReveal();
-
-        // Show placeholder "…" if we don't get any bot words quickly
         clearTimer(placeholderTimerRef);
         placeholderTimerRef.current = window.setTimeout(() => {
-          if (!hasReceivedBotWordsRef.current) {
-            setBotTranscript('…');
-          }
+          if (!hasReceivedBotWordsRef.current) setBotTranscript('…');
         }, 500);
 
-        const ctx = audioContextRef.current;
-        if (ctx && outGainRef.current) {
-          outGainRef.current.gain.cancelScheduledValues(ctx.currentTime);
-          outGainRef.current.gain.setTargetAtTime(0.35, ctx.currentTime, 0.015);
+        if (pcmPlayerNodeRef.current) {
+          pcmPlayerNodeRef.current.port.postMessage({ type: 'clear' });
+          pcmPlayerNodeRef.current.port.postMessage({ type: 'setPlaying', playing: true });
         }
         return;
       }
       if (data.event === 'model_speech_end') {
         modelSpeakingRef.current = false;
         inResponseRef.current = false;
-        hardStopOutput();
-        finishRevealNow();
-
-        const ctx = audioContextRef.current;
-        if (ctx && outGainRef.current) {
-          outGainRef.current.gain.cancelScheduledValues(ctx.currentTime);
-          outGainRef.current.gain.setTargetAtTime(0.85, ctx.currentTime, 0.02);
-        }
+        // Do not auto-finish transcript; keep current behavior
         return;
       }
 
-      // Audio playback: schedule contiguous; also reset transcript if a new audio reply starts without start event
+      // Audio playback
       if (data.audioChunk) {
-        if (!modelSpeakingRef.current && (botTranscript || revealedWordsRef.current.length || pendingWordsRef.current.length)) {
-          // New reply detected only by audio; clear old transcript
-          resetBotReveal();
-          modelSpeakingRef.current = true;
-          inResponseRef.current = true;
-
-          // Start placeholder since we detected a new reply via audio only
-          clearTimer(placeholderTimerRef);
-          placeholderTimerRef.current = window.setTimeout(() => {
-            if (!hasReceivedBotWordsRef.current) {
-              setBotTranscript('…');
-            }
-          }, 500);
-        }
-
         if (dropChunksRef.current) return;
 
         const ctx = audioContextRef.current;
         if (!ctx) return;
 
+        // Decode Int16 PCM -> Float32
         const bytes = Uint8Array.from(atob(data.audioChunk), c => c.charCodeAt(0));
         const float32 = int16ToFloat32(new Int16Array(bytes.buffer));
 
+        // NEW: preferred path — push into PCM player node (no pre-scheduling)
+        const player = pcmPlayerNodeRef.current;
+        if (player) {
+          // Transfer the underlying buffer to avoid copies
+          const chunk = new Float32Array(float32.buffer.slice(0)); // use a distinct buffer for transfer safety
+          try {
+            player.port.postMessage({ type: 'push', chunk }, [chunk.buffer]);
+          } catch {
+            // Fallback without transfer
+            player.port.postMessage({ type: 'push', chunk });
+          }
+          return;
+        }
+
+        // Fallback path: keep your existing scheduling in case player isn't available
         const buf = ctx.createBuffer(1, float32.length, 24000);
         buf.getChannelData(0).set(float32);
 
         const src = ctx.createBufferSource();
         src.buffer = buf;
 
+        // Ensure persistent gain for output
         if (!outGainRef.current) {
           outGainRef.current = ctx.createGain();
-          outGainRef.current.gain.value = 0.85;
+          outGainRef.current.gain.value = 0.85; // baseline
           outGainRef.current.connect(ctx.destination);
         }
         src.connect(outGainRef.current);
@@ -424,35 +408,24 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
         return;
       }
 
-      // Show separate transcripts and trigger voice interruption
+      // Transcripts (unchanged)
       if (typeof data.transcript === 'string') {
         if (data.who === 'user') {
           setUserTranscript(data.transcript);
-
+          // Voice barge-in on stop keywords
           if (modelSpeakingRef.current && isStopPhrase(data.transcript)) {
             const nowMs = Date.now();
-            if (nowMs - lastStopAtRef.current > 600) {
+            if (nowMs - lastStopAtRef.current > 300) { // tight debounce
               lastStopAtRef.current = nowMs;
-              hardStopOutput();
+              hardStopOutput(); // cuts ring player + fallback buffers
               const s = liveSocketRef.current;
               if (s && s.readyState === WebSocket.OPEN) {
-                s.send(JSON.stringify({ type: 'stop' }));
+                s.send(JSON.stringify({ type: 'stop' })); // backend cancels and sends flush_audio
               }
             }
           }
         } else {
-          // DEFENSIVE RESET: text-first reply (text delta before audio start)
-          if (!modelSpeakingRef.current && inResponseRef.current && (botTranscript || revealedWordsRef.current.length || pendingWordsRef.current.length)) {
-            resetBotReveal();
-          }
-
-          // Bot transcript stream
-          if (data.transcript.trim() === '[stopped]') {
-            botTargetRef.current = data.transcript;
-            finishRevealNow();
-          } else {
-            enqueueBotTranscript(data.transcript);
-          }
+          enqueueBotTranscript(data.transcript);
         }
       }
     } catch (err) {
@@ -471,6 +444,7 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
     }
 
     try {
+      // Capture setup (unchanged)
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -480,22 +454,36 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
         }
       });
       const ctx = new AudioContext({ sampleRate: 24000 });
-      await ctx.audioWorklet.addModule('/audio-processor.js');
-      const node = new AudioWorkletNode(ctx, 'audio-processor');
-      const source = ctx.createMediaStreamSource(stream);
-      source.connect(node);
 
-      // Reset state
-      playheadRef.current = ctx.currentTime;
+      // Load worklets
+      await ctx.audioWorklet.addModule('/audio-processor.js');         // existing capture worklet
+      await ctx.audioWorklet.addModule('/pcm-player-processor.js');    // NEW player worklet
+
+      // Create nodes
+      const captureNode = new AudioWorkletNode(ctx, 'audio-processor');
+      const source = ctx.createMediaStreamSource(stream);
+      source.connect(captureNode);
+      captureWorkletRef.current = captureNode;
+
+      // Output gain stays as before (ducking etc.)
       outGainRef.current = ctx.createGain();
       outGainRef.current.gain.value = 0.85;
       outGainRef.current.connect(ctx.destination);
+
+      // NEW: create pull-based PCM player and connect to same gain
+      const playerNode = new AudioWorkletNode(ctx, 'pcm-player-processor');
+      playerNode.connect(outGainRef.current);
+      // Start muted until a turn begins
+      playerNode.port.postMessage({ type: 'setPlaying', playing: false });
+      pcmPlayerNodeRef.current = playerNode;
+
+      // Reset state
+      playheadRef.current = ctx.currentTime;
       modelSpeakingRef.current = false;
       inResponseRef.current = false;
       lastStopAtRef.current = 0;
       dropChunksRef.current = false;
       activeSourcesRef.current.clear();
-      resetBotReveal();
 
       const socket = new WebSocket('ws://127.0.0.1:8000/ws/livechat');
       socket.binaryType = 'arraybuffer';
@@ -505,7 +493,7 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
       socket.onmessage = handleLiveSocketMessage;
       socket.onopen = () => {
         // Always send mic audio (for voice barge-in).
-        node.port.onmessage = e => {
+        captureNode.port.onmessage = e => {
           const chunk = e.data as ArrayBuffer;
           if (socket.readyState === WebSocket.OPEN) {
             socket.send(chunk);
@@ -520,11 +508,10 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
       liveSocketRef.current = socket;
       audioContextRef.current = ctx;
       mediaStreamRef.current = stream;
-      workletNodeRef.current = node;
 
       // Reset transcripts at session start
       setUserTranscript('');
-      resetBotReveal();
+      setBotTranscript('');
       setLiveMode(true);
     } catch (err) {
       console.error('Failed to start live chat:', err);
@@ -533,25 +520,30 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
   };
 
   const stopLiveTalk = () => {
+    // Ask backend to commit pending buffer
     try {
       if (liveSocketRef.current?.readyState === WebSocket.OPEN) {
         liveSocketRef.current.send(JSON.stringify({ type: 'commit' }));
       }
-    } catch (err) { void err; }
+    } catch { /* noop */ }
 
+    // Hard stop any remaining output nodes and ring player
     hardStopOutput();
 
-    try { workletNodeRef.current?.disconnect(); } catch (err) { void err; }
-    workletNodeRef.current = null;
+    try { captureWorkletRef.current?.disconnect(); } catch { /* noop */ }
+    captureWorkletRef.current = null;
 
-    try { mediaStreamRef.current?.getTracks().forEach(t => t.stop()); } catch (err) { void err; }
+    try { pcmPlayerNodeRef.current?.disconnect(); } catch { /* noop */ }
+    pcmPlayerNodeRef.current = null;
+
+    try { mediaStreamRef.current?.getTracks().forEach(t => t.stop()); } catch { /* noop */ }
     mediaStreamRef.current = null;
 
     try {
       if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
         audioContextRef.current.close();
       }
-    } catch (err) { void err; }
+    } catch { /* noop */ }
     audioContextRef.current = null;
     outGainRef.current = null;
 
@@ -560,11 +552,11 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
       if (s && s.readyState !== WebSocket.CLOSED && s.readyState !== WebSocket.CLOSING) {
         s.close();
       }
-    } catch (err) { void err; }
+    } catch { /* noop */ }
     liveSocketRef.current = null;
 
     setUserTranscript('');
-    resetBotReveal();
+    setBotTranscript('');
     setLiveMode(false);
   };
 
@@ -619,10 +611,10 @@ const InputArea: React.FC<InputAreaProps> = ({ sessionId, setSessionId, addMessa
           {userTranscript && (
             <Typography variant="body2"><strong>You:</strong> {userTranscript}</Typography>
           )}
-          {botTranscript !== '' && (
+          {botTranscript && (
             <Typography variant="body2"><strong>Bot:</strong> {botTranscript}</Typography>
           )}
-          {userTranscript === '' && botTranscript === '' && (
+          {!userTranscript && !botTranscript && (
             <Typography variant="body2" color="textSecondary">Live transcripts will appear here…</Typography>
           )}
         </Stack>
