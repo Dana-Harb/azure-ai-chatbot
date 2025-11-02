@@ -2,7 +2,6 @@ import os
 import json
 import logging
 import requests
-from rag_pipeline import generate_response_with_context
 from session_store import clear_session, get_session
 
 # --- Function Definitions for AI ---
@@ -28,7 +27,7 @@ def get_function_definitions():
             "type": "function",
             "function": {
                 "name": "find_coffee_shops",
-                "description": "Find up to 3 coffee shops near a specific city using Foursquare and OpenStreetMap APIs",  
+                "description": "Find up to 3 coffee shops near a specific city using OpenStreetMap APIs",  
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -41,22 +40,6 @@ def get_function_definitions():
                         }
                     },
                     "required": ["city"],
-                    "additionalProperties": False
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "search_coffee_knowledge",
-                "description": "Search through coffee knowledge base for information",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "The search query to find relevant coffee information"},
-                        "top_k": {"type": "integer", "description": "Number of top results to return", "default": 3}
-                    },
-                    "required": ["query"],
                     "additionalProperties": False
                 }
             }
@@ -103,12 +86,6 @@ def clear_conversation_fn(session_id, reason=None):
 
 def find_coffee_shops_fn(city, coffee_type="any"):
     try:
-        # Try Foursquare first (your new API key)
-        foursquare_result = try_foursquare_search(city, coffee_type)
-        if foursquare_result and foursquare_result.get("places"):
-            return foursquare_result
-        
-        # Fallback to OpenStreetMap if Foursquare fails
         osm_result = try_osm_search(city, coffee_type)
         if osm_result and osm_result.get("places"):
             return osm_result
@@ -122,103 +99,6 @@ def find_coffee_shops_fn(city, coffee_type="any"):
     except Exception as e:
         logging.error(f"All search methods failed: {str(e)}")
         return {"error": f"Search failed: {str(e)}", "places": []}
-
-def try_foursquare_search(city, coffee_type):
-    """Use Foursquare API"""
-    try:
-        api_key = os.getenv("FOURSQUARE_API_KEY")
-        if not api_key:
-            logging.error("FOURSQUARE_API_KEY not found in environment")
-            return None
-            
-        logging.info(f"🚀 Trying Foursquare API for {city} with coffee_type: {coffee_type}")
-
-        # Map coffee types to Foursquare categories
-        category_map = {
-            "specialty": "13032",  
-            "cafe": "13032",         
-            "espresso_bar": "13032", 
-            "roastery": "13032",   
-            "any": "13032"         
-        }
-        
-        category_id = category_map.get(coffee_type, "13032")
-        
-        search_url = "https://api.foursquare.com/v3/places/search"
-        headers = {
-            "Authorization": api_key,
-            "Accept": "application/json"
-        }
-        
-        params = {
-            "query": "coffee",
-            "near": city,  
-            "limit": 5,
-            "categories": category_id,
-            "sort": "DISTANCE"
-        }
-        
-        # Add more specific queries for specialty coffee
-        if coffee_type == "specialty":
-            params["query"] = "specialty coffee third wave"
-        
-        logging.info(f"📡 Foursquare request: {params}")
-        
-        response = requests.get(search_url, headers=headers, params=params, timeout=15)
-        logging.info(f"📨 Foursquare response status: {response.status_code}")
-        
-        if response.status_code != 200:
-            logging.error(f" Foursquare API failed: {response.status_code} - {response.text}")
-            return None
-            
-        data = response.json()
-        logging.info(f" Foursquare found {len(data.get('results', []))} total results")
-        
-        places = []
-        for venue in data.get("results", [])[:3]:
-            location = venue.get("location", {})
-            
-            # Build address
-            address_parts = []
-            if location.get("address"):
-                address_parts.append(location.get("address"))
-            if location.get("locality"):
-                address_parts.append(location.get("locality"))
-            if location.get("region"):
-                address_parts.append(location.get("region"))
-            if location.get("country"):
-                address_parts.append(location.get("country")) 
-                
-            address = ", ".join(address_parts) if address_parts else "Address not available"
-            
-            place_data = {
-                "name": venue.get("name", "Coffee Shop"),
-                "address": address,
-                "distance": f"{location.get('distance', 0)}m",
-                "categories": [cat.get('name', '') for cat in venue.get('categories', [])]
-            }
-            
-            
-            if venue.get('rating'):
-                place_data["rating"] = f"{venue.get('rating')}/10"
-                
-            places.append(place_data)
-            logging.info(f" Foursquare found: {venue.get('name')} - {address}")
-
-        logging.info(f" Foursquare returning {len(places)} places")
-        return {
-            "city": city, 
-            "coffee_type": coffee_type,
-            "places_found": len(places), 
-            "places": places, 
-            "source": "foursquare"
-        }
-        
-    except Exception as e:
-        logging.error(f" Foursquare search failed: {str(e)}")
-        import traceback
-        logging.error(traceback.format_exc())
-        return None
 
 def try_osm_search(city, coffee_type):
     """Fallback to OpenStreetMap"""
@@ -304,12 +184,6 @@ def try_osm_search(city, coffee_type):
         logging.error(f"OSM fallback also failed: {str(e)}")
         return None
 
-def search_coffee_knowledge_fn(query, top_k=3):
-    rag_response = generate_response_with_context(query, top_k=top_k)
-    return {"answer": rag_response.get("answer", "No information found"),
-            "references": rag_response.get("references", []),
-            "query": query}
-
 def calculate_brew_ratio_fn(coffee_amount, water_amount, brew_method=None):
     ratio = water_amount / coffee_amount
     advice = f"Brew ratio: 1:{ratio:.1f} (coffee:water)"
@@ -327,7 +201,6 @@ def calculate_brew_ratio_fn(coffee_amount, water_amount, brew_method=None):
 FUNCTION_MAP = {
     "clear_conversation": clear_conversation_fn,
     "find_coffee_shops": find_coffee_shops_fn,
-    "search_coffee_knowledge": search_coffee_knowledge_fn,
     "calculate_brew_ratio": calculate_brew_ratio_fn
 }
 

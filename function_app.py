@@ -17,7 +17,8 @@ import uuid
 
 from tools import get_function_definitions, execute_function
 
-from rag_pipeline import generate_response_with_context, index_all_blobs_stream, get_openai_client, AZURE_OPENAI_DEPLOYMENT
+# ADDED: retrieve_similar_docs import for context injection
+from rag_pipeline import generate_response_with_context, retrieve_similar_docs, index_all_blobs_stream, get_openai_client, AZURE_OPENAI_DEPLOYMENT
 from speech_interface import listen, synthesize_text_to_audio
 
 from azure.identity import DefaultAzureCredential
@@ -29,6 +30,40 @@ from datetime import datetime
 
 
 logging.info("Function app started - lazy loading enabled")
+
+# ADDED: Helper to inject RAG context for every query
+def build_rag_context_message(user_text: str, top_k: int = 3):
+    """
+    Retrieve similar docs and return a system message that the model
+    can use as context for answering. This runs for every query.
+    """
+    try:
+        docs = retrieve_similar_docs(user_text, top_k=top_k) or []
+        context_text = ""
+        for d in docs:
+            title = d.get("title", "Untitled")
+            chunk = d.get("chunk", "")
+            context_text += f"\nTitle: {title}\nContent: {chunk}\n"
+        if not context_text:
+            context_text = "No relevant documents found."
+        return {
+            "role": "system",
+            "content": (
+                "You have access to reference documents which may contain relevant information.\n"
+                "Use them only if helpful and cite the Title(s) briefly. Keep answers concise (2–3 sentences).\n"
+                f"Reference documents:\n{context_text}"
+            )
+        }
+    except Exception as e:
+        logging.error(f"[RAG] Context retrieval failed: {str(e)}")
+        # Return a minimal instruction if retrieval fails
+        return {
+            "role": "system",
+            "content": (
+                "Reference documents are temporarily unavailable. "
+                "Answer concisely based on your general coffee knowledge (2–3 sentences)."
+            )
+        }
 
 @app.route(route="login", methods=["POST", "OPTIONS"])
 def login(req: func.HttpRequest) -> func.HttpResponse:
@@ -208,6 +243,9 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
         
         # Prepare messages for OpenAI with function definitions
         messages = history.copy()
+
+        # ADDED: Inject RAG context for EVERY query (outside of function-calling)
+        messages.append(build_rag_context_message(user_text, top_k=3))
         
         # Add user message
         messages.append({"role": "user", "content": user_text})
@@ -217,7 +255,7 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
             clear_session(session_id)
             ai_reply = "Chat history cleared."
         else:
-            # Step 1: First API call - check if functions should be called
+            # Step 1: First API call - model may call tools (shops/ratio)
             try:
                 client = get_openai_client()
                 deployment = AZURE_OPENAI_DEPLOYMENT
@@ -225,7 +263,7 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
                 first_response = client.chat.completions.create(
                     model=deployment,
                     messages=messages,
-                    tools=get_function_definitions(),
+                    tools=get_function_definitions(),  # tools now exclude knowledge search
                     max_tokens=400,
                     temperature=0.7,
                 )
@@ -245,7 +283,7 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
                     # Step 3: Execute each function call
                     for tool_call in tool_calls:
                         function_name = tool_call.function.name
-                        function_args = json.loads(tool_call.function.arguments)
+                        function_args = json.loads(tool_call.function.arguments or "{}")
                         
                         # Execute the function using the centralized function with session_id
                         function_response = execute_function(function_name, function_args, session_id)
@@ -268,7 +306,7 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
                     ai_reply = second_response.choices[0].message.content
                     
                 else:
-                    # No function calls, use direct response
+                    # No function calls → the model answers using the injected RAG context
                     ai_reply = response_message.content
                     
             except Exception as e:
